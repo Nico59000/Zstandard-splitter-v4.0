@@ -9,8 +9,8 @@ SSH/SFTP administration. This README is cumulative: it describes the inherited
 
 - **3.0 — strict integrity:** canonical source inventory, compressed-archive SHA-256, per-part SHA-256, reconstruction checks, extraction, and restored-content validation.
 - **4.0 — transactional SSH/SFTP:** push, pull, staging, locking, remote verification, optional remote extraction, and atomic bundle publication.
-- **4.1 boundary:** profiles, parallelism, window/buffer tuning, connection-reuse controls, and MTU diagnostics are intentionally unavailable.
-- **4.2 boundary:** fan-out, quorum, relay, health, inventory, garbage collection, and JSON Lines audit logging are intentionally unavailable.
+- **4.1 future version boundary:** profiles, parallelism, window/buffer tuning, connection-reuse controls, and MTU diagnostics are intentionally unavailable.
+- **4.2 future version boundary:** fan-out, quorum, relay, health, inventory, garbage collection, and JSON Lines audit logging are intentionally unavailable.
 - **4.0 — original feature release:** uses the GNU-oriented dependency profile; use the matching `.1` release for macOS/BSD abstraction.
 
 ## Local archive layer inherited from 3.0
