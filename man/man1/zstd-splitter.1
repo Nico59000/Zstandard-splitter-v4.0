@@ -1,0 +1,109 @@
+.TH ZSTD-SPLITTER 1 "July 2026" "zstd-splitter 4.0" "User Commands"
+.SH NAME
+zstd-splitter \- create, split, verify, transfer, reconstruct and extract compressed tar archives
+.SH SYNOPSIS
+.B zstd-splitter -c -s size [options] source
+.br
+.B zstd-splitter -j [options] part
+.br
+.B zstd-splitter -x [options] input
+.br
+.B zstd-splitter -v [options] input
+.br
+.B zstd-splitter -P -i -R destination [options] input
+.br
+.B zstd-splitter -G -i -R remote-input [options]
+.br
+.B zstd-splitter -Q mode [ -R destination ] [options]
+.SH DESCRIPTION
+Version 4.0 is a POSIX /bin/sh utility for selectable tar compression engines, deterministic split-part naming, optional strict SHA-256 manifests, and version-gated SSH/SFTP workflows.
+.PP
+Strict mode records a canonical source inventory, the compressed archive size and SHA-256, and the size and SHA-256 of every part. Verification and extraction recheck the applicable layers before publication.
+.SH LOCAL ACTIONS
+.TP
+.B -c
+Create, compress and split a tar stream.
+.TP
+.B -j
+Verify and join split parts.
+.TP
+.B -x
+Extract an archive or a verified part set.
+.TP
+.B -v
+Verify without extraction.
+.TP
+.B -E
+List compression engines.
+.SH NETWORK ACTIONS
+.TP
+.B -P
+Push one local archive or strict part set.
+.TP
+.B -G
+Pull one remote archive or part set.
+.TP
+.BI -Q " mode"
+Run one of: network, config.
+.SH COMMON OPTIONS
+.TP
+.BI -e " engine"
+Select zstd, gzip, bzip2, xz, lzma, lzip, lzop or lz4.
+.TP
+.BI -s " size"
+Maximum split-part size.
+.TP
+.BI -l " level"
+Codec-specific compression level.
+.TP
+.BI -T " threads"
+Worker count for supported codecs.
+.TP
+.B -i
+Enable strict integrity.
+.TP
+.BI -m " manifest"
+Use an explicit strict manifest.
+.TP
+.BI -d " directory"
+Extraction or pull destination.
+.TP
+.B -f
+Allow replacement; also required for destructive GC in 4.2 releases.
+.TP
+.BI -R " [user@]host:/absolute/path"
+Select a remote source or destination.
+.TP
+.BI -O " name=value"
+Set one network option; repeatable.
+.TP
+.BI -F " file"
+Read network options from a file.
+.SH NETWORK MODEL
+All 4.x releases provide strict single-destination push/pull, retry, staging, locking, remote verification, atomic bundle publication, optional remote extraction, bandwidth limiting, bastion/identity controls, and safe host-key policies.
+
+.SS 4.1 boundary
+Profiles, parallel workers, SFTP-window tuning, connection-reuse tuning, and route/MTU diagnostics are rejected by this release.
+.SS 4.2 administration boundary
+Fan-out, quorum, relay, health, inventory, garbage collection and JSONL audit are rejected.
+
+.SH PORTABILITY
+This original feature release expects the GNU-oriented dependency set documented in the package. Use the corresponding .1 maintenance release for macOS/BSD abstraction.
+.SH FEATURE LEVEL
+The executable declares FEATURE_LEVEL=40. Dormant later-version helper functions in the shared source are not public capabilities; runtime gates and tests enforce this boundary.
+.SH FILES
+.TP
+.I *.manifest.sha256
+Strict integrity manifest.
+.TP
+.I *.part.aaaaaa
+Split archive part.
+.TP
+.I *.bundle
+Atomically published remote bundle directory.
+.SH EXIT STATUS
+0 for success, 1 for operational or integrity failure, and 2 for invalid syntax, invalid options, or a feature-gate violation.
+.SH SECURITY
+StrictHostKeyChecking is never disabled. Remote payload files remain partial until verified. Manifests are parsed as data and are not sourced as shell code.
+.SH SEE ALSO
+tar(1), ssh(1), sftp(1), sha256sum(1), shasum(1), openssl(1)

@@ -1,0 +1,77 @@
+Usage:
+  zstd-splitter.sh -c -s SIZE [-e ENGINE] [-l LEVEL] [-T THREADS] [-i] [-f]
+                [-R DESTINATION] [-O NAME=VALUE] SOURCE
+  zstd-splitter.sh -j [-i] [-m MANIFEST] [-f] PART
+  zstd-splitter.sh -x [-i] [-m MANIFEST] [-d DIRECTORY] [-f] INPUT
+  zstd-splitter.sh -v [-i] [-m MANIFEST] INPUT
+  zstd-splitter.sh -P -i -R DESTINATION [-O NAME=VALUE] INPUT
+  zstd-splitter.sh -G -i -R REMOTE_INPUT [-d DIRECTORY] [-O NAME=VALUE]
+  zstd-splitter.sh -Q MODE [-R DESTINATION] [-O NAME=VALUE]
+  zstd-splitter.sh -E
+  zstd-splitter.sh -h
+  zstd-splitter.sh
+
+Local actions:
+  -c            Create a tar archive, compress it, and split it.
+  -j            Join archive parts and verify the reconstructed stream.
+  -x            Extract an archive, or join parts and then extract them.
+  -v            Verify an archive or a set of parts without extracting it.
+  -E            List supported compression engines.
+
+Network actions:
+  -P            Push a local archive or strict part set through SSH/SFTP.
+  -G            Pull one remote archive or part set through SSH/SFTP.
+  -Q MODE       Run a query: network, or config.
+
+Network selection:
+  -R SPEC       Remote specification: [USER@]HOST:/absolute/path.
+                One effective remote is accepted per operation.
+  -O NAME=VALUE Set a network option. Repeatable.
+  -F FILE       Read network options from FILE (one NAME=VALUE per line).
+
+Common options:
+  -e ENGINE     Compression engine used with -c. Default: zstd.
+  -s SIZE       Maximum size of each part. Required with -c.
+  -l LEVEL      Compression level. The accepted range depends on ENGINE.
+  -T THREADS    Worker threads for zstd, xz, or lzma. Default: 0.
+  -i            Enable strict SHA-256 integrity processing.
+  -m MANIFEST   Use an explicit strict-integrity manifest.
+  -d DIRECTORY  Local extraction or pull destination.
+  -f            Permit replacement of an existing output.
+  -h            Display this help text and exit.
+  --            End option processing.
+
+Baseline network options (4.0 and later):
+  transport=sftp|ssh-stream       resume=yes|no       atomic=yes|no
+  remote-verify=parts|archive|content|all|none
+  remote-extract=PATH|auto        remote-fsync=yes|no
+  identity=FILE                   port=PORT           jump=HOST
+  host-key-policy=strict|accept-new
+  known-hosts=FILE                address-family=any|inet|inet6
+  bind-interface=INTERFACE        bind-address=ADDRESS
+  ssh-compression=yes|no          bandwidth=KBIT/S
+  connect-timeout=SECONDS         server-alive-interval=SECONDS
+  server-alive-count=COUNT        retry=COUNT
+  retry-delay=SECONDS             retry-backoff=linear|exponential
+  cleanup=success|always|never    retain=parts|archive|all
+  lock=yes|no                     allow-unverified=yes|no
+  dry-run=yes|no
+
+Release capability boundary:
+  3.0: strict source, archive, and per-part SHA-256 integrity.
+  4.0: transactional single-destination SSH/SFTP push and pull.
+  This release does not enable 4.1 profiles, parallelism, SFTP-window
+  tuning, connection-reuse controls, or MTU diagnostics.
+  This release does not enable 4.2 fan-out, quorum, relay, health,
+  inventory, garbage collection, or JSONL audit logging.
+
+Examples:
+  zstd-splitter.sh -c -i -s 1G -R backup@nas:/srv/backups source
+  zstd-splitter.sh -P -i -R backup@nas:/srv/backups archive.tar.zst.part.aaaaaa
+  zstd-splitter.sh -G -i -R backup@nas:/srv/backups/archive.tar.zst.bundle/archive.tar.zst.part.aaaaaa -d restored-parts
+
+Compatibility aliases:
+  zstd-splitter.sh --help       is accepted as an alias for -h.
+  zstd-splitter.sh --engines    is accepted as an alias for -E.
+
+When run without arguments, the script displays the local interactive menu.

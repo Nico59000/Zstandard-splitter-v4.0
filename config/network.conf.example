@@ -1,0 +1,20 @@
+# zstd-splitter 4.0 network configuration example
+# Baseline 4.0 transaction controls
+host-key-policy=strict
+resume=yes
+atomic=yes
+remote-fsync=yes
+retry=3
+retry-delay=3
+retry-backoff=linear
+connect-timeout=15
+server-alive-interval=15
+server-alive-count=3
+bandwidth=0
+# identity=/root/.ssh/backup_ed25519
+# jump=admin@bastion.example.net
+# known-hosts=/etc/ssh/ssh_known_hosts
+
+# 4.1 controls are unavailable in this package.
+
+# 4.2 quorum, audit-log, and gc-days controls are unavailable.
