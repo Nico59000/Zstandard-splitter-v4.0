@@ -115,23 +115,3 @@ The mocked SSH/SFTP tests validate deterministic command and transaction behavio
 they do not claim testing on every physical operating system or network.
 
 
-## Runtime security audit revision
-
-Package revision `runtime-security-audit-r2` incorporates the 2026-07-28
-execution-security review without changing the public feature level of
-version 4.0. It hardens shell quoting, temporary state, signal cleanup,
-extraction staging, manifest ambiguity checks, transactional publication,
-pull verification, remote-stage cleanup, persistent SSH control-session
-cleanup, and terminal-safe diagnostics.
-
-Run:
-
-```sh
-sh tests/runtime-static-audit.sh
-sh tests/runtime-security-test.sh
-```
-
-The complete threat model and residual limits are documented in
-[`docs/RUNTIME-SECURITY.md`](docs/RUNTIME-SECURITY.md). SHA-256 provides
-integrity, not origin authentication; security-sensitive deployments should
-protect or sign manifests independently.
