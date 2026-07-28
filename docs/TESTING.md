@@ -34,3 +34,17 @@ sh packaging/verify-checksums.sh
 Mocked tests are deterministic and suitable for regression testing, but they do
 not replace execution against physical Linux, macOS, OpenBSD, FreeBSD, and NetBSD
 hosts with real OpenSSH servers and network paths.
+
+
+## Runtime security audit
+
+```sh
+sh tests/runtime-static-audit.sh
+sh tests/runtime-security-test.sh
+sh tests/packaging-security-test.sh
+```
+
+The static test pins the execution invariants in the source. The adversarial
+test covers injection, hostile environments, private modes, special objects,
+traversal, ambiguous manifests, signals, rollback, remote quoting, collision
+cleanup, corrupt pulls, and persistent SSH control-session cleanup.

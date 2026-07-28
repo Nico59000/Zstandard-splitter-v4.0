@@ -5,11 +5,11 @@ zstd-splitter-4.0/
   README.md
   TREE.txt
   VERSION
-  checksums/
+  checksums
   checksums/SHA256SUMS
-  config/
+  config
   config/network.conf.example
-  docs/
+  docs
   docs/BUILTIN_HELP.txt
   docs/CODE-ARCHITECTURE.md
   docs/ENGINES.txt
@@ -17,23 +17,27 @@ zstd-splitter-4.0/
   docs/INTEGRITY-MANIFEST.md
   docs/MIGRATION-3.0.md
   docs/NETWORK-OPTIONS.md
+  docs/RUNTIME-SECURITY.md
   docs/SECURITY.md
   docs/TESTING.md
   docs/VERSION-MATRIX.md
-  examples/
+  examples
   examples/network.md
-  man/
-  man/man1/
+  man
+  man/man1
   man/man1/zstd-splitter.1
   man/man1/zstd-splitter.1.gz
-  packaging/
+  packaging
   packaging/install.sh
   packaging/uninstall.sh
-  src/
+  src
   src/zstd-splitter.sh
-  tests/
+  tests
   tests/documentation-test.sh
   tests/feature-matrix-test.sh
   tests/mock-network-test.sh
   tests/network-dry-run.sh
+  tests/packaging-security-test.sh
+  tests/runtime-security-test.sh
+  tests/runtime-static-audit.sh
   tests/smoke-test.sh

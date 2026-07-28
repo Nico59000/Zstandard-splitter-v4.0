@@ -105,5 +105,32 @@ Atomically published remote bundle directory.
 0 for success, 1 for operational or integrity failure, and 2 for invalid syntax, invalid options, or a feature-gate violation.
 .SH SECURITY
 StrictHostKeyChecking is never disabled. Remote payload files remain partial until verified. Manifests are parsed as data and are not sourced as shell code.
+
+.SH RUNTIME SECURITY AUDIT
+The 2026-07-28 package revision uses a private umask, sanitized command
+lookup, private temporary directories, global signal cleanup, receiver-side
+verification, transactional local and remote publication, and explicit
+cleanup of remote staging and persistent SSH control masters.
+Archive members are listed and checked before extraction into a private
+staging tree. FIFO, device, socket, control-character path, ambiguous
+manifest, option-like SSH target, and unsafe jump-hop inputs are refused.
+.PP
+The environment variable
+.B ZSTD_SPLITTER_TMPDIR
+is the only supported override for the private network temporary parent;
+ambient
+.B TMPDIR
+is intentionally ignored. The override and every directory in
+.B ZSTD_SPLITTER_PATH
+must be administrator-controlled.
+.PP
+SHA-256 manifests provide integrity but not origin authentication. Running
+untrusted extraction as root, operating in attacker-writable parent
+directories, resource exhaustion, and concurrent source mutation remain
+outside the protection that a portable shell script can fully guarantee.
+See
+.B docs/RUNTIME-SECURITY.md
+in the distribution.
+
 .SH SEE ALSO
 tar(1), ssh(1), sftp(1), sha256sum(1), shasum(1), openssl(1)

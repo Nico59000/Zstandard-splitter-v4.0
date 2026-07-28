@@ -45,6 +45,19 @@ set -eu
 LC_ALL=C
 export LC_ALL
 
+# Runtime environment hardening.  Archive data and remote staging may contain
+# sensitive material, so files created by this process are private by default.
+# Environment variables that can silently inject options into tar/compressors
+# are cleared before any external utility is started.
+IFS=' \t\n'
+CDPATH=
+ENV=
+BASH_ENV=
+unset TAR_OPTIONS GZIP BZIP BZIP2 XZ_DEFAULTS XZ_OPT ZSTD_CLEVEL \
+    ZSTD_NBTHREADS LZIP LZOP LZ4_CLEVEL POSIXLY_CORRECT ENV BASH_ENV CDPATH \
+    2>/dev/null || :
+umask 077
+
 PROGRAM_NAME=${0##*/}
 PROGRAM_VERSION=4.0
 MANIFEST_FORMAT=1
@@ -66,6 +79,11 @@ COMPRESS_PID=
 SPLIT_PID=
 EXTRACT_PID=
 LAST_ARCHIVE=
+CHILD_PIDS=
+RUNTIME_PATH_READY=0
+EXTRACTION_DESTINATION=
+EXTRACTION_STAGE=
+EXTRACTION_BACKUP=
 
 FEATURE_LEVEL=40
 NETWORK_OPTIONS=
@@ -110,7 +128,7 @@ NET_MTU_CHECK=off
 NET_MTU_REQUIRED=9000
 NET_TUNE=off
 NET_REMOTE_FSYNC=yes
-NET_CLEANUP=success
+NET_CLEANUP=always
 NET_DRY_RUN=no
 NET_QUORUM=0
 NET_AUDIT_LOG=
@@ -118,19 +136,471 @@ NET_GC_DAYS=7
 NET_RETAIN=all
 NET_LOCK=yes
 NET_ALLOW_UNVERIFIED=no
+ACTIVE_STAGE_TARGET=
+ACTIVE_STAGE_DIR=
+ACTIVE_STAGE_LOCK=
+NETWORK_CONNECTED_TARGETS=
 
 
 # -----------------------------------------------------------------------------
 # CLI presentation and user-visible diagnostics
 # -----------------------------------------------------------------------------
+escape_control_text()
+{
+    ZSS_ESCAPE_VALUE=$1
+    export ZSS_ESCAPE_VALUE
+    awk 'BEGIN {
+        value = ENVIRON["ZSS_ESCAPE_VALUE"]
+        for (i = 1; i < 32; i++) control[sprintf("%c", i)] = sprintf("\\u%04x", i)
+        control[sprintf("%c", 127)] = "\\u007f"
+        for (i = 1; i <= length(value); i++) {
+            c = substr(value, i, 1)
+            if (c in control) printf "%s", control[c]
+            else printf "%s", c
+        }
+    }'
+    unset ZSS_ESCAPE_VALUE
+}
+
 print_error()
 {
-    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    printf '%s: %s\n' "$(escape_control_text "$PROGRAM_NAME")" "$(escape_control_text "$*")" >&2
 }
 
 print_info()
 {
-    printf '%s\n' "$*"
+    printf '%s\n' "$(escape_control_text "$*")"
+}
+
+# -----------------------------------------------------------------------------
+# Runtime-security primitives
+# -----------------------------------------------------------------------------
+runtime_sanitize_path()
+{
+    [ "$RUNTIME_PATH_READY" -eq 0 ] || return 0
+    runtime_path_input=${ZSTD_SPLITTER_PATH-${PATH-}}
+    [ -n "$runtime_path_input" ] || runtime_path_input=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+    runtime_path_output=
+    runtime_old_ifs=$IFS
+    IFS=:
+    set -f
+    for runtime_path_entry in $runtime_path_input
+    do
+        case $runtime_path_entry in
+            /*)
+                if [ -z "$runtime_path_output" ]; then
+                    runtime_path_output=$runtime_path_entry
+                else
+                    runtime_path_output=$runtime_path_output:$runtime_path_entry
+                fi
+                ;;
+            '') : ;; # Empty entries mean the current directory and are dropped.
+            *) print_error "ignoring unsafe relative PATH entry: $runtime_path_entry" ;;
+        esac
+    done
+    set +f
+    IFS=$runtime_old_ifs
+    [ -n "$runtime_path_output" ] || runtime_path_output=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+    PATH=$runtime_path_output
+    export PATH
+    RUNTIME_PATH_READY=1
+}
+
+contains_control_characters()
+{
+    control_newline='
+'
+    control_tab='	'
+    control_cr=$(printf '\r')
+    case $1 in
+        *"$control_newline"*|*"$control_tab"*|*"$control_cr"*) return 0 ;;
+    esac
+    printf '%s' "$1" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1
+}
+
+absolute_existing_path()
+{
+    absolute_input=$1
+    contains_control_characters "$absolute_input" && return 1
+    case $absolute_input in /*) ;; *) absolute_input=$(pwd -P)/$absolute_input ;; esac
+    absolute_dir=$(dirname "$absolute_input")
+    absolute_base=$(basename "$absolute_input")
+    absolute_dir=$(cd "$absolute_dir" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "${absolute_dir%/}" "$absolute_base"
+}
+
+absolute_destination_path()
+{
+    destination_input=$1
+    contains_control_characters "$destination_input" && return 1
+    [ -n "$destination_input" ] || return 1
+    case $destination_input in /*) ;; *) destination_input=$(pwd -P)/$destination_input ;; esac
+    destination_parent=$(dirname "$destination_input")
+    destination_base=$(basename "$destination_input")
+    case $destination_base in ''|.|..) return 1 ;; esac
+    case "/$destination_input/" in */../*|*/./*) return 1 ;; esac
+    mkdir -p "$destination_parent" || return 1
+    destination_parent=$(cd "$destination_parent" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "${destination_parent%/}" "$destination_base"
+}
+
+unsafe_destructive_path()
+{
+    destructive_path=$1
+    case $destructive_path in ''|/|//|///|.|..) return 0 ;; esac
+    case "/$destructive_path/" in */../*|*/./*) return 0 ;; esac
+    if [ -d "$destructive_path" ] && [ ! -L "$destructive_path" ]; then
+        destructive_real=$(cd "$destructive_path" 2>/dev/null && pwd -P) || return 0
+        [ "$destructive_real" = / ] && return 0
+    fi
+    return 1
+}
+
+safe_remove_tree()
+{
+    remove_path=$1
+    [ -e "$remove_path" ] || [ -L "$remove_path" ] || return 0
+    if unsafe_destructive_path "$remove_path"; then
+        print_error "refusing unsafe recursive removal: $remove_path"
+        return 1
+    fi
+    rm -rf "$remove_path"
+}
+
+secure_tmp_parent()
+{
+    # Ambient TMPDIR is intentionally ignored: privileged wrappers and service
+    # managers may inherit it from an untrusted caller. Administrators may set
+    # the explicit trusted override ZSTD_SPLITTER_TMPDIR.
+    secure_parent=${ZSTD_SPLITTER_TMPDIR:-/tmp}
+    case $secure_parent in /*) ;; *) secure_parent=/tmp ;; esac
+    [ ! -L "$secure_parent" ] && [ -d "$secure_parent" ] && [ -w "$secure_parent" ] || secure_parent=/tmp
+    (cd "$secure_parent" 2>/dev/null && pwd -P)
+}
+
+register_child_pid()
+{
+    case ${1-} in ''|*[!0-9]*) return 0 ;; esac
+    case " $CHILD_PIDS " in *" $1 "*) return 0 ;; esac
+    CHILD_PIDS="$CHILD_PIDS $1"
+}
+
+unregister_child_pid()
+{
+    unregister_target=${1-}
+    unregister_new=
+    unregister_old_ifs=$IFS
+    IFS=' '
+    for unregister_pid in $CHILD_PIDS
+    do
+        [ "$unregister_pid" = "$unregister_target" ] || unregister_new="$unregister_new $unregister_pid"
+    done
+    IFS=$unregister_old_ifs
+    CHILD_PIDS=$unregister_new
+}
+
+
+terminate_children()
+{
+    child_old_ifs=$IFS
+    IFS=' '
+    for child_pid in $CHILD_PIDS "$TAR_PID" "$COMPRESS_PID" "$SPLIT_PID" "$EXTRACT_PID" ${PROGRESS_PID-}
+    do
+        case $child_pid in ''|*[!0-9]*) continue ;; esac
+        kill "$child_pid" 2>/dev/null || :
+    done
+    for child_pid in $CHILD_PIDS "$TAR_PID" "$COMPRESS_PID" "$SPLIT_PID" "$EXTRACT_PID" ${PROGRESS_PID-}
+    do
+        case $child_pid in ''|*[!0-9]*) continue ;; esac
+        wait "$child_pid" 2>/dev/null || :
+    done
+    IFS=$child_old_ifs
+    CHILD_PIDS=
+}
+
+source_type_walk()
+{
+    type_path=$1
+    if contains_control_characters "$type_path"; then
+        print_error "refusing filesystem path containing a control character: $type_path"
+        return 1
+    fi
+    if [ -L "$type_path" ]; then
+        type_link_target=$(readlink "$type_path") || return 1
+        if contains_control_characters "$type_link_target"; then
+            print_error "refusing symbolic-link target containing a control character: $type_path"
+            return 1
+        fi
+        return 0
+    fi
+    if [ -f "$type_path" ]; then return 0; fi
+    if [ -d "$type_path" ]; then
+        for type_child in "$type_path"/* "$type_path"/.[!.]* "$type_path"/..?*
+        do
+            [ -e "$type_child" ] || [ -L "$type_child" ] || continue
+            (source_type_walk "$type_child") || return 1
+        done
+        return 0
+    fi
+    print_error "refusing unsupported special filesystem object: $type_path"
+    return 1
+}
+
+validate_tar_member_list()
+{
+    member_list=$1
+    awk '
+        function bad_component(path, n,a,i) {
+            n=split(path,a,"/")
+            for (i=1;i<=n;i++) if (a[i] == "..") return 1
+            return 0
+        }
+        {
+            name=$0
+            if (name == "") next
+            if (name ~ /^\// || bad_component(name)) {
+                print "unsafe archive member: " name > "/dev/stderr"
+                exit 1
+            }
+            if (name ~ /[[:cntrl:]]/) {
+                print "archive member contains a control character" > "/dev/stderr"
+                exit 1
+            }
+        }
+    ' "$member_list"
+}
+
+validate_archive_members()
+{
+    member_archive=$1
+    member_engine=$2
+    member_fifo=$WORK_DIR/member-list.pipe
+    member_file=$WORK_DIR/member-list.txt
+    rm -f "$member_fifo" "$member_file"
+    mkfifo "$member_fifo" || return 1
+    start_decompressor "$member_engine" "$member_archive" "$member_fifo"
+    member_compress_pid=$COMPRESS_PID
+    register_child_pid "$member_compress_pid"
+    tar -tf "$member_fifo" >"$member_file" &
+    member_tar_pid=$!
+    register_child_pid "$member_tar_pid"
+    member_status=0
+    wait "$member_compress_pid" || member_status=1
+    unregister_child_pid "$member_compress_pid"
+    COMPRESS_PID=
+    wait "$member_tar_pid" || member_status=1
+    unregister_child_pid "$member_tar_pid"
+    rm -f "$member_fifo"
+    [ "$member_status" -eq 0 ] || {
+        print_error "cannot safely list archive members before extraction"
+        return 1
+    }
+    validate_tar_member_list "$member_file" || {
+        print_error "archive member safety validation failed"
+        return 1
+    }
+}
+
+validate_remote_target()
+{
+    remote_target_value=$1
+    [ -n "$remote_target_value" ] || return 1
+    contains_control_characters "$remote_target_value" && return 1
+    case $remote_target_value in
+        -*|*[!A-Za-z0-9._@%+:\[\],-]*) return 1 ;;
+    esac
+    case ${remote_target_value#*@} in *@*) return 1 ;; esac
+    return 0
+}
+
+validate_jump_spec()
+{
+    jump_value=$1
+    [ -z "$jump_value" ] && return 0
+    [ "$jump_value" = none ] && return 0
+    jump_old_ifs=$IFS
+    IFS=,
+    set -f
+    for jump_hop in $jump_value
+    do
+        validate_remote_target "$jump_hop" || { set +f; IFS=$jump_old_ifs; return 1; }
+    done
+    set +f
+    IFS=$jump_old_ifs
+    return 0
+}
+
+validate_remote_path()
+{
+    remote_path_value=$1
+    case $remote_path_value in /*) ;; *) return 1 ;; esac
+    contains_control_characters "$remote_path_value" && return 1
+    case "/$remote_path_value/" in */../*|*/./*) return 1 ;; esac
+    return 0
+}
+
+validate_remote_extract_path()
+{
+    remote_extract_value=$1
+    [ -z "$remote_extract_value" ] && return 0
+    [ "$remote_extract_value" = auto ] && return 0
+    validate_remote_path "$remote_extract_value" || return 1
+    case $remote_extract_value in /|//|///) return 1 ;; esac
+    return 0
+}
+
+validate_plain_option_text()
+{
+    contains_control_characters "$1" && return 1
+    return 0
+}
+
+publish_staged_files()
+{
+    publish_stage=$1
+    publish_destination=$2
+    [ -d "$publish_stage" ] || return 1
+    [ -d "$publish_destination" ] && [ ! -L "$publish_destination" ] || return 1
+
+    publish_collision=0
+    for publish_file in "$publish_stage"/* "$publish_stage"/.[!.]* "$publish_stage"/..?*
+    do
+        [ -e "$publish_file" ] || [ -L "$publish_file" ] || continue
+        publish_final=$publish_destination/${publish_file##*/}
+        if [ -e "$publish_final" ] || [ -L "$publish_final" ]; then publish_collision=1; fi
+    done
+    if [ "$publish_collision" -eq 1 ]; then
+        confirm_replace "Destination files already exist. Replace them transactionally?" || return 1
+    fi
+
+    publish_backup=$publish_destination/.zstd-splitter-backup.$$
+    publish_index=0
+    while ! mkdir "$publish_backup" 2>/dev/null; do
+        publish_index=$((publish_index + 1))
+        [ "$publish_index" -le 100 ] || return 1
+        publish_backup=$publish_destination/.zstd-splitter-backup.$$.$publish_index
+    done
+    chmod 700 "$publish_backup" 2>/dev/null || :
+    publish_moved_list=$publish_backup/.moved
+    publish_new_list=$publish_backup/.new
+    : >"$publish_moved_list"; : >"$publish_new_list"
+
+    publish_rollback()
+    {
+        while IFS= read -r rollback_name
+        do
+            [ -n "$rollback_name" ] || continue
+            rm -f "$publish_destination/$rollback_name" 2>/dev/null || :
+        done <"$publish_new_list"
+        while IFS= read -r rollback_name
+        do
+            [ -n "$rollback_name" ] || continue
+            if [ -e "$publish_backup/$rollback_name" ] || [ -L "$publish_backup/$rollback_name" ]; then
+                mv "$publish_backup/$rollback_name" "$publish_destination/$rollback_name" 2>/dev/null || :
+            fi
+        done <"$publish_moved_list"
+    }
+
+    for publish_file in "$publish_stage"/* "$publish_stage"/.[!.]* "$publish_stage"/..?*
+    do
+        [ -e "$publish_file" ] || [ -L "$publish_file" ] || continue
+        publish_name=${publish_file##*/}
+        contains_control_characters "$publish_name" && { publish_rollback; safe_remove_tree "$publish_backup" || :; return 1; }
+        publish_final=$publish_destination/$publish_name
+        if [ -e "$publish_final" ] || [ -L "$publish_final" ]; then
+            mv "$publish_final" "$publish_backup/$publish_name" || {
+                publish_rollback; safe_remove_tree "$publish_backup" || :; return 1;
+            }
+            printf '%s\n' "$publish_name" >>"$publish_moved_list"
+        fi
+        if ! mv "$publish_file" "$publish_final"; then
+            publish_rollback
+            safe_remove_tree "$publish_backup" || :
+            return 1
+        fi
+        printf '%s\n' "$publish_name" >>"$publish_new_list"
+    done
+    safe_remove_tree "$publish_backup" || return 1
+    safe_remove_tree "$publish_stage" || :
+}
+
+publish_generated_set()
+{
+    generated_prefix=$1
+    final_prefix=$2
+    generated_manifest=$3
+    final_manifest=$4
+    generated_strict=$5
+    generated_dir=$(dirname "$final_prefix")
+    generated_backup=$generated_dir/.zstd-splitter-publish.$$
+    generated_index=0
+    while ! mkdir "$generated_backup" 2>/dev/null; do
+        generated_index=$((generated_index + 1))
+        [ "$generated_index" -le 100 ] || return 1
+        generated_backup=$generated_dir/.zstd-splitter-publish.$$.$generated_index
+    done
+    chmod 700 "$generated_backup" 2>/dev/null || :
+    generated_old=$generated_backup/.old
+    generated_new=$generated_backup/.new
+    : >"$generated_old"; : >"$generated_new"
+
+    for generated_existing in "$final_prefix"??????
+    do
+        [ -e "$generated_existing" ] || [ -L "$generated_existing" ] || continue
+        generated_suffix=${generated_existing#"$final_prefix"}
+        case $generated_suffix in
+            [a-z][a-z][a-z][a-z][a-z][a-z])
+                generated_name=${generated_existing##*/}
+                mv "$generated_existing" "$generated_backup/$generated_name" || { safe_remove_tree "$generated_backup" || :; return 1; }
+                printf '%s\n' "$generated_name" >>"$generated_old"
+                ;;
+        esac
+    done
+    if [ "$generated_strict" -eq 1 ] && { [ -e "$final_manifest" ] || [ -L "$final_manifest" ]; }; then
+        generated_name=${final_manifest##*/}
+        mv "$final_manifest" "$generated_backup/$generated_name" || { safe_remove_tree "$generated_backup" || :; return 1; }
+        printf '%s\n' "$generated_name" >>"$generated_old"
+    fi
+
+    generated_rollback()
+    {
+        while IFS= read -r generated_name
+        do
+            [ -n "$generated_name" ] || continue
+            rm -f "$generated_dir/$generated_name" 2>/dev/null || :
+        done <"$generated_new"
+        while IFS= read -r generated_name
+        do
+            [ -n "$generated_name" ] || continue
+            if [ -e "$generated_backup/$generated_name" ] || [ -L "$generated_backup/$generated_name" ]; then
+                mv "$generated_backup/$generated_name" "$generated_dir/$generated_name" 2>/dev/null || :
+            fi
+        done <"$generated_old"
+    }
+
+    PUBLISHED_PARTS=0
+    for generated_part in "$generated_prefix"??????
+    do
+        [ -f "$generated_part" ] || continue
+        generated_suffix=${generated_part#"$generated_prefix"}
+        case $generated_suffix in [a-z][a-z][a-z][a-z][a-z][a-z]) ;; *) continue ;; esac
+        generated_final=$final_prefix$generated_suffix
+        generated_name=${generated_final##*/}
+        if ! mv "$generated_part" "$generated_final"; then
+            generated_rollback; safe_remove_tree "$generated_backup" || :; return 1
+        fi
+        printf '%s\n' "$generated_name" >>"$generated_new"
+        PUBLISHED_PARTS=$((PUBLISHED_PARTS + 1))
+    done
+    if [ "$generated_strict" -eq 1 ]; then
+        generated_name=${final_manifest##*/}
+        if ! mv "$generated_manifest" "$final_manifest"; then
+            generated_rollback; safe_remove_tree "$generated_backup" || :; return 1
+        fi
+        printf '%s\n' "$generated_name" >>"$generated_new"
+    fi
+    safe_remove_tree "$generated_backup" || return 1
+    [ "$PUBLISHED_PARTS" -gt 0 ]
 }
 
 list_engines()
@@ -228,6 +698,11 @@ Examples:
   $PROGRAM_NAME -P -i -R backup@nas:/srv/backups archive.tar.zst.part.aaaaaa
   $PROGRAM_NAME -G -i -R backup@nas:/srv/backups/archive.tar.zst.bundle/archive.tar.zst.part.aaaaaa -d restored-parts
 
+Runtime-security environment:
+  ZSTD_SPLITTER_PATH     Trusted colon-separated absolute command path.
+  ZSTD_SPLITTER_TMPDIR   Trusted absolute parent for private network state.
+                         Ambient TMPDIR is intentionally ignored.
+
 Compatibility aliases:
   $PROGRAM_NAME --help       is accepted as an alias for -h.
   $PROGRAM_NAME --engines    is accepted as an alias for -E.
@@ -238,24 +713,40 @@ EOF_USAGE
 
 cleanup()
 {
+    cleanup_status=$?
     trap - 0 1 2 3 15
 
-    for cleanup_pid in "$TAR_PID" "$COMPRESS_PID" "$SPLIT_PID" "$EXTRACT_PID"
-    do
-        if [ -n "$cleanup_pid" ]; then
-            kill "$cleanup_pid" 2>/dev/null || :
-        fi
-    done
+    terminate_children
+    network_abort_active_stage
+    network_close_control_masters
 
-    if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
-        rm -rf "$WORK_DIR"
+    # If publication of an extracted tree was interrupted after the previous
+    # destination had been moved aside, restore that previous tree.
+    if [ -n "$EXTRACTION_BACKUP" ] && { [ -e "$EXTRACTION_BACKUP" ] || [ -L "$EXTRACTION_BACKUP" ]; }; then
+        if [ -n "$EXTRACTION_DESTINATION" ] && { [ -e "$EXTRACTION_DESTINATION" ] || [ -L "$EXTRACTION_DESTINATION" ]; }; then
+            safe_remove_tree "$EXTRACTION_DESTINATION" || :
+        fi
+        [ -z "$EXTRACTION_DESTINATION" ] || mv "$EXTRACTION_BACKUP" "$EXTRACTION_DESTINATION" 2>/dev/null || :
+        EXTRACTION_BACKUP=
     fi
-    if [ -n "$NETWORK_TEMP_DIR" ] && [ -d "$NETWORK_TEMP_DIR" ]; then
-        rm -rf "$NETWORK_TEMP_DIR"
-    fi
+    if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then safe_remove_tree "$WORK_DIR" || :; fi
+    if [ -n "$NETWORK_TEMP_DIR" ] && [ -d "$NETWORK_TEMP_DIR" ]; then safe_remove_tree "$NETWORK_TEMP_DIR" || :; fi
+    return "$cleanup_status"
 }
 
-trap cleanup 0 1 2 3 15
+handle_signal()
+{
+    signal_name=$1
+    signal_status=$2
+    print_error "operation interrupted by $signal_name"
+    exit "$signal_status"
+}
+
+trap cleanup 0
+trap 'handle_signal HUP 129' 1
+trap 'handle_signal INT 130' 2
+trap 'handle_signal QUIT 131' 3
+trap 'handle_signal TERM 143' 15
 
 require_command()
 {
@@ -395,25 +886,32 @@ require_engine()
 make_work_dir()
 {
     work_parent=$1
+    work_parent=$(cd "$work_parent" 2>/dev/null && pwd -P) || {
+        print_error "cannot access temporary-directory parent: $work_parent"
+        return 1
+    }
     old_umask=$(umask)
     umask 077
-
-    work_index=0
-    while :
-    do
-        WORK_DIR=$work_parent/.tar-splitter.$$.${work_index}
-        if mkdir "$WORK_DIR" 2>/dev/null; then
-            break
-        fi
-        work_index=$((work_index + 1))
-        if [ "$work_index" -gt 100 ]; then
-            umask "$old_umask"
-            print_error "cannot create a temporary working directory in: $work_parent"
-            return 1
-        fi
-    done
-
+    WORK_DIR=
+    if command -v mktemp >/dev/null 2>&1; then
+        WORK_DIR=$(mktemp -d "$work_parent/.tar-splitter.XXXXXX" 2>/dev/null || :)
+    fi
+    if [ -z "$WORK_DIR" ]; then
+        work_index=0
+        while [ "$work_index" -le 100 ]
+        do
+            WORK_DIR=$work_parent/.tar-splitter.$$.$work_index
+            mkdir "$WORK_DIR" 2>/dev/null && break
+            WORK_DIR=
+            work_index=$((work_index + 1))
+        done
+    fi
     umask "$old_umask"
+    [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ] || {
+        print_error "cannot create a private temporary working directory in: $work_parent"
+        return 1
+    }
+    chmod 700 "$WORK_DIR" 2>/dev/null || :
 }
 
 confirm_replace()
@@ -619,6 +1117,27 @@ validate_manifest_structure()
         return 1
     fi
 
+    if ! awk -F '\t' '
+        BEGIN {
+            required["tool_version"]=1; required["engine"]=1; required["archive_name"]=1;
+            required["archive_size"]=1; required["archive_sha256"]=1;
+            required["source_root"]=1; required["source_entry_count"]=1;
+            required["source_tree_sha256"]=1; required["part_count"]=1;
+            required["part_size_bytes"]=1
+        }
+        $1 in required { count[$1]++ }
+        $1 == "part" { if (seen_part[$2]++) bad=1 }
+        $1 == "end" && $2 == "manifest" { end_count++ }
+        END {
+            for (key in required) if (count[key] != 1) bad=1
+            if (end_count != 1) bad=1
+            exit bad ? 1 : 0
+        }
+    ' "$manifest_path"; then
+        print_error "manifest contains duplicate, missing, or ambiguous records"
+        return 1
+    fi
+
     manifest_engine=$(manifest_value engine "$manifest_path")
     manifest_archive_sha=$(manifest_value archive_sha256 "$manifest_path")
     manifest_source_sha=$(manifest_value source_tree_sha256 "$manifest_path")
@@ -632,6 +1151,11 @@ validate_manifest_structure()
         print_error "manifest is missing required fields: $manifest_path"
         return 1
     fi
+
+    case $manifest_engine in
+        zstd|gzip|bzip2|xz|lzma|lzip|lzop|lz4) ;;
+        *) print_error "unsupported compression engine in manifest: $manifest_engine"; return 1 ;;
+    esac
 
     validate_sha256_text "$manifest_archive_sha" || {
         print_error "invalid archive SHA-256 in manifest"
@@ -1073,6 +1597,7 @@ compress_and_split()
     fi
 
     source_actual=$source_dir/$source_name
+    source_type_walk "$source_actual" || return 1
     archive_extension=$(engine_extension "$ENGINE")
     archive_file=$source_dir/$source_name.tar.$archive_extension
     output_prefix=$archive_file.part.
@@ -1126,17 +1651,23 @@ compress_and_split()
 
     tar -C "$source_dir" -cf "$tar_pipe" "./$source_name" &
     TAR_PID=$!
+    register_child_pid "$TAR_PID"
     start_compressor "$tar_pipe" "$compressed_pipe"
+    register_child_pid "$COMPRESS_PID"
     split -a "$SUFFIX_LENGTH" -b "$part_size_bytes" \
         "$compressed_pipe" "$temporary_prefix" &
     SPLIT_PID=$!
+    register_child_pid "$SPLIT_PID"
 
     pipeline_status=0
     if ! wait "$TAR_PID"; then pipeline_status=1; fi
+    unregister_child_pid "$TAR_PID"
     TAR_PID=
     if ! wait "$COMPRESS_PID"; then pipeline_status=1; fi
+    unregister_child_pid "$COMPRESS_PID"
     COMPRESS_PID=
     if ! wait "$SPLIT_PID"; then pipeline_status=1; fi
+    unregister_child_pid "$SPLIT_PID"
     SPLIT_PID=
 
     if [ "$pipeline_status" -ne 0 ]; then
@@ -1188,30 +1719,12 @@ compress_and_split()
         validate_manifest_structure "$temporary_manifest" || return 1
     fi
 
-    for existing_part in "$output_prefix"??????
-    do
-        if [ -f "$existing_part" ]; then
-            suffix=${existing_part#"$output_prefix"}
-            case $suffix in
-                [a-z][a-z][a-z][a-z][a-z][a-z]) rm -f "$existing_part" ;;
-            esac
-        fi
-    done
-    if [ "$STRICT_INTEGRITY" -eq 1 ]; then
-        rm -f "$output_manifest"
+    if ! publish_generated_set "$temporary_prefix" "$output_prefix" "$temporary_manifest" "$output_manifest" "$STRICT_INTEGRITY"; then
+        print_error "cannot publish archive parts transactionally; previous outputs were restored"
+        return 1
     fi
 
-    for temporary_part in "$temporary_prefix"??????
-    do
-        [ -f "$temporary_part" ] || continue
-        suffix=${temporary_part#"$temporary_prefix"}
-        mv "$temporary_part" "$output_prefix$suffix"
-    done
-    if [ "$STRICT_INTEGRITY" -eq 1 ]; then
-        mv "$temporary_manifest" "$output_manifest"
-    fi
-
-    rm -rf "$WORK_DIR"
+    safe_remove_tree "$WORK_DIR"
     WORK_DIR=
 
     LAST_PART_PREFIX=$output_prefix
@@ -1229,7 +1742,7 @@ compress_and_split()
 
 join_parts()
 {
-    selected_part=$1
+    selected_part=$(absolute_existing_path "$1") || { print_error "cannot resolve part path: $1"; return 1; }
 
     if [ ! -f "$selected_part" ]; then
         print_error "part does not exist: $selected_part"
@@ -1282,7 +1795,7 @@ join_parts()
     fi
 
     mv -f "$temporary_archive" "$output_file"
-    rm -rf "$WORK_DIR"
+    safe_remove_tree "$WORK_DIR"
     WORK_DIR=
     LAST_ARCHIVE=$output_file
 
@@ -1291,7 +1804,7 @@ join_parts()
 
 verify_input()
 {
-    verify_input_path=$1
+    verify_input_path=$(absolute_existing_path "$1") || { print_error "cannot resolve input path: $1"; return 1; }
 
     if detected_engine=$(detect_engine_from_part "$verify_input_path" 2>/dev/null); then
         if [ ! -f "$verify_input_path" ]; then
@@ -1320,7 +1833,7 @@ verify_input()
             validate_archive_against_manifest "$temporary_archive" "$ENGINE" \
                 "$strict_manifest" || return 1
         fi
-        rm -rf "$WORK_DIR"
+        safe_remove_tree "$WORK_DIR"
         WORK_DIR=
         print_info "Verification completed successfully for the part set."
         return 0
@@ -1350,88 +1863,109 @@ verify_input()
             "$strict_manifest" || return 1
     fi
 
-    rm -rf "$WORK_DIR"
+    safe_remove_tree "$WORK_DIR"
     WORK_DIR=
     print_info "Archive verification completed successfully: $verify_input_path"
 }
 
 prepare_extraction_destination()
 {
-    destination_path=$1
-
-    if [ "$destination_path" = / ] || [ -z "$destination_path" ]; then
-        print_error "refusing unsafe extraction destination: $destination_path"
+    destination_path=$(absolute_destination_path "$1") || {
+        print_error "refusing unsafe extraction destination: $1"
         return 1
-    fi
-
+    }
     if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
-        if ! confirm_replace "Extraction destination already exists. Remove and recreate it?"; then
+        confirm_replace "Extraction destination already exists. Replace it transactionally?" || {
             print_info "Operation cancelled."
             return 1
-        fi
-        rm -rf "$destination_path"
+        }
     fi
+    EXTRACTION_DESTINATION=$destination_path
+    extraction_parent=$(dirname "$destination_path")
+    make_work_dir "$extraction_parent" || return 1
+    EXTRACTION_STAGE=$WORK_DIR/extracted
+    mkdir "$EXTRACTION_STAGE" || return 1
+    chmod 700 "$EXTRACTION_STAGE" 2>/dev/null || :
+}
 
-    mkdir -p "$destination_path"
+publish_extraction_destination()
+{
+    extraction_destination=$EXTRACTION_DESTINATION
+    extraction_stage=$EXTRACTION_STAGE
+    extraction_parent=$(dirname "$extraction_destination")
+    extraction_backup=$extraction_parent/.zstd-splitter-extract-backup.$$
+    extraction_index=0
+    while [ -e "$extraction_backup" ] || [ -L "$extraction_backup" ]; do
+        extraction_index=$((extraction_index + 1))
+        [ "$extraction_index" -le 100 ] || return 1
+        extraction_backup=$extraction_parent/.zstd-splitter-extract-backup.$$.$extraction_index
+    done
+    EXTRACTION_BACKUP=
+    if [ -e "$extraction_destination" ] || [ -L "$extraction_destination" ]; then
+        mv "$extraction_destination" "$extraction_backup" || return 1
+        EXTRACTION_BACKUP=$extraction_backup
+    fi
+    if ! mv "$extraction_stage" "$extraction_destination"; then
+        [ -z "$EXTRACTION_BACKUP" ] || mv "$EXTRACTION_BACKUP" "$extraction_destination" 2>/dev/null || :
+        return 1
+    fi
+    if [ -n "$EXTRACTION_BACKUP" ]; then safe_remove_tree "$EXTRACTION_BACKUP" || return 1; fi
+    EXTRACTION_STAGE=
+    EXTRACTION_BACKUP=
 }
 
 extract_archive()
 {
-    extract_input=$1
+    extract_input=$(absolute_existing_path "$1") || { print_error "cannot resolve archive input: $1"; return 1; }
     extract_archive_path=$extract_input
 
     if detected_engine=$(detect_engine_from_part "$extract_input" 2>/dev/null); then
         join_parts "$extract_input" || return 1
         extract_archive_path=$LAST_ARCHIVE
     else
-        if ! detected_engine=$(detect_engine_from_archive "$extract_input"); then
-            print_error "unsupported archive or part name: $extract_input"
-            return 2
-        fi
-        if [ ! -f "$extract_input" ]; then
-            print_error "archive does not exist: $extract_input"
-            return 1
-        fi
+        if ! detected_engine=$(detect_engine_from_archive "$extract_input"); then print_error "unsupported archive or part name: $extract_input"; return 2; fi
+        [ -f "$extract_input" ] || { print_error "archive does not exist: $extract_input"; return 1; }
         ENGINE=$detected_engine
         require_engine "$ENGINE" || return 1
     fi
 
     archive_dir=$(dirname "$extract_archive_path")
     archive_base=$(archive_base_without_extension "$extract_archive_path")
-    if [ -z "$DESTINATION" ]; then
-        extraction_destination=$archive_base.extracted
-    else
-        extraction_destination=$DESTINATION
-    fi
+    if [ -z "$DESTINATION" ]; then extraction_destination=$archive_base.extracted; else extraction_destination=$DESTINATION; fi
 
     strict_manifest=
     if [ "$STRICT_INTEGRITY" -eq 1 ]; then
         strict_manifest=$(resolve_manifest "$extract_archive_path" archive)
         make_work_dir "$archive_dir"
-        validate_archive_against_manifest "$extract_archive_path" "$ENGINE" \
-            "$strict_manifest" || return 1
-        rm -rf "$WORK_DIR"
-        WORK_DIR=
+        validate_archive_against_manifest "$extract_archive_path" "$ENGINE" "$strict_manifest" || return 1
+        safe_remove_tree "$WORK_DIR"; WORK_DIR=
     fi
 
     prepare_extraction_destination "$extraction_destination" || return 1
-    extraction_parent=$(dirname "$extraction_destination")
-    make_work_dir "$extraction_parent"
+    validate_archive_members "$extract_archive_path" "$ENGINE" || return 1
     tar_pipe=$WORK_DIR/extract.tar.pipe
-    mkfifo "$tar_pipe"
+    mkfifo "$tar_pipe" || return 1
 
-    print_info "Extracting with engine $ENGINE to: $extraction_destination"
+    print_info "Extracting with engine $ENGINE to private staging: $EXTRACTION_STAGE"
+    :
     start_decompressor "$ENGINE" "$extract_archive_path" "$tar_pipe"
-    tar -C "$extraction_destination" -xf "$tar_pipe" &
+    extract_compress_pid=$COMPRESS_PID
+    register_child_pid "$extract_compress_pid"
+    ( cd "$EXTRACTION_STAGE" && tar -xf "$tar_pipe" ) &
     EXTRACT_PID=$!
+    register_child_pid "$EXTRACT_PID"
+    :
 
     extraction_status=0
-    if ! wait "$COMPRESS_PID"; then extraction_status=1; fi
+    wait "$extract_compress_pid" || extraction_status=1
+    unregister_child_pid "$extract_compress_pid"
     COMPRESS_PID=
-    if ! wait "$EXTRACT_PID"; then extraction_status=1; fi
+    wait "$EXTRACT_PID" || extraction_status=1
+    unregister_child_pid "$EXTRACT_PID"
     EXTRACT_PID=
-
+    :
     if [ "$extraction_status" -ne 0 ]; then
+        :
         print_error "decompression or tar extraction failed"
         return 1
     fi
@@ -1439,14 +1973,12 @@ extract_archive()
     if [ "$STRICT_INTEGRITY" -eq 1 ]; then
         extracted_records=$WORK_DIR/extracted-source.records
         expected_records=$WORK_DIR/expected-source.records
-        generate_source_records_for_directory_contents "$extraction_destination" \
-            "$extracted_records" || return 1
+        generate_source_records_for_directory_contents "$EXTRACTION_STAGE" "$extracted_records" || return 1
         awk -F '\t' '$1 == "source" { print }' "$strict_manifest" >"$expected_records"
         extracted_sha=$(sha256_file "$extracted_records")
         expected_sha=$(manifest_value source_tree_sha256 "$strict_manifest")
-
-        if [ "$extracted_sha" != "$expected_sha" ] || \
-           ! cmp -s "$expected_records" "$extracted_records"; then
+        if [ "$extracted_sha" != "$expected_sha" ] || ! cmp -s "$expected_records" "$extracted_records"; then
+            :
             print_error "extracted source tree failed strict SHA-256 validation"
             print_error "expected: $expected_sha"
             print_error "actual:   $extracted_sha"
@@ -1455,26 +1987,34 @@ extract_archive()
         print_info "Extracted source tree SHA-256 verified: $extracted_sha"
     fi
 
-    rm -rf "$WORK_DIR"
+    publish_extraction_destination || { :; print_error "cannot publish extracted directory transactionally"; return 1; }
+    :
+    safe_remove_tree "$WORK_DIR"
     WORK_DIR=
-    print_info "Extraction completed and verified: $extraction_destination"
+    print_info "Extraction completed and verified: $EXTRACTION_DESTINATION"
 }
 
-
-# -----------------------------------------------------------------------------
-# Network state collection and configuration loading
-# -----------------------------------------------------------------------------
 append_line()
 {
     append_variable=$1
     append_value=$2
-    eval "append_current=\${$append_variable-}"
-    if [ -n "$append_current" ]; then
-        append_current=$(printf '%s\n%s' "$append_current" "$append_value")
-    else
-        append_current=$append_value
-    fi
-    eval "$append_variable=\$append_current"
+    case $append_variable in
+        REMOTE_DESTINATIONS)
+            if [ -n "$REMOTE_DESTINATIONS" ]; then
+                REMOTE_DESTINATIONS=$(printf '%s\n%s' "$REMOTE_DESTINATIONS" "$append_value")
+            else
+                REMOTE_DESTINATIONS=$append_value
+            fi
+            ;;
+        NETWORK_OPTIONS)
+            if [ -n "$NETWORK_OPTIONS" ]; then
+                NETWORK_OPTIONS=$(printf '%s\n%s' "$NETWORK_OPTIONS" "$append_value")
+            else
+                NETWORK_OPTIONS=$append_value
+            fi
+            ;;
+        *) print_error "internal append target is not permitted: $append_variable"; return 2 ;;
+    esac
 }
 
 resolve_self_path()
@@ -1496,23 +2036,28 @@ resolve_self_path()
 make_network_temp_dir()
 {
     [ -n "$NETWORK_TEMP_DIR" ] && [ -d "$NETWORK_TEMP_DIR" ] && return 0
-    network_tmp_parent=${TMPDIR:-/tmp}
+    network_tmp_parent=$(secure_tmp_parent) || return 1
     old_umask=$(umask)
     umask 077
-    NETWORK_TEMP_DIR=$network_tmp_parent/zstd-splitter-network.$$
-    if ! mkdir "$NETWORK_TEMP_DIR" 2>/dev/null; then
+    NETWORK_TEMP_DIR=$(mktemp -d "$network_tmp_parent/zstd-splitter-network.XXXXXX" 2>/dev/null || :)
+    if [ -z "$NETWORK_TEMP_DIR" ]; then
         network_index=0
-        while [ "$network_index" -lt 100 ]; do
-            network_index=$((network_index + 1))
+        while [ "$network_index" -le 100 ]; do
             NETWORK_TEMP_DIR=$network_tmp_parent/zstd-splitter-network.$$.$network_index
             mkdir "$NETWORK_TEMP_DIR" 2>/dev/null && break
+            NETWORK_TEMP_DIR=
+            network_index=$((network_index + 1))
         done
     fi
     umask "$old_umask"
-    [ -d "$NETWORK_TEMP_DIR" ] || {
-        print_error "cannot create network temporary directory"
+    [ -n "$NETWORK_TEMP_DIR" ] && [ -d "$NETWORK_TEMP_DIR" ] || {
+        print_error "cannot create private network temporary directory"
         return 1
     }
+    chmod 700 "$NETWORK_TEMP_DIR" 2>/dev/null || :
+    NETWORK_CONTROL_DIR=$NETWORK_TEMP_DIR/control
+    mkdir "$NETWORK_CONTROL_DIR" || return 1
+    chmod 700 "$NETWORK_CONTROL_DIR" 2>/dev/null || :
 }
 
 network_require_commands()
@@ -1704,6 +2249,21 @@ network_validate_settings()
     case $NET_CLEANUP in success|always|never) ;; *) print_error "invalid cleanup policy"; return 2 ;; esac
     case $NET_RETAIN in parts|archive|all) ;; *) print_error "invalid retain value"; return 2 ;; esac
     case $NET_REMOTE_VERIFY in parts|archive|content|all|none) ;; *) print_error "invalid remote-verify"; return 2 ;; esac
+    case $NET_SSH_COMPRESSION in yes|no) ;; *) print_error "ssh-compression must be yes or no"; return 2 ;; esac
+    case $NET_CONTROL_MASTER in no|yes|ask|auto|autoask) ;; *) print_error "invalid control-master value"; return 2 ;; esac
+    case $NET_CONTROL_PERSIST in no|yes|''|*[!0-9]*) print_error "control-persist must be a non-negative integer"; return 2 ;; esac
+    [ -z "$NET_PORT" ] || { validate_integer_range "$NET_PORT" 1 65535 || { print_error "port must be in 1..65535"; return 2; }; }
+    validate_remote_extract_path "$NET_REMOTE_EXTRACT" || { print_error "unsafe remote-extract path"; return 2; }
+    for text_value in "$NET_KNOWN_HOSTS" "$NET_IDENTITY" "$NET_JUMP" "$NET_BIND_INTERFACE" "$NET_BIND_ADDRESS" "$NET_AUDIT_LOG"
+    do
+        validate_plain_option_text "$text_value" || { print_error "network option contains a control character"; return 2; }
+    done
+    validate_jump_spec "$NET_JUMP" || { print_error "invalid or unsafe jump destination"; return 2; }
+    [ "$NET_RETRY" -le 100 ] || { print_error "retry exceeds safety limit 100"; return 2; }
+    [ "$NET_RETRY_DELAY" -le 3600 ] || { print_error "retry-delay exceeds safety limit 3600"; return 2; }
+    [ "$NET_JOBS" -le 64 ] || { print_error "jobs exceeds safety limit 64"; return 2; }
+    [ "$NET_SFTP_BUFFER" -le 16777216 ] || { print_error "sftp-buffer exceeds safety limit 16 MiB"; return 2; }
+    [ "$NET_SFTP_REQUESTS" -le 1024 ] || { print_error "sftp-requests exceeds safety limit 1024"; return 2; }
 
     if [ "$FEATURE_LEVEL" -lt 41 ]; then
         [ "$NET_PROFILE" = safe ] || { print_error "network profiles require version 4.1"; return 2; }
@@ -1725,6 +2285,7 @@ network_validate_settings()
 
 # Applies profile defaults, overlays explicit options, validates values, and
 # enforces the release feature boundary before any network side effect.
+
 network_initialize()
 {
     requested_profile=$(network_find_last_option profile || :)
@@ -1737,7 +2298,7 @@ network_initialize()
     set -f
     for network_line in $(network_read_option_lines)
     do
-        network_apply_pair "$network_line" || { IFS=$old_ifs; return; }
+        network_apply_pair "$network_line" || { set +f; IFS=$old_ifs; return; }
     done
     set +f
     IFS=$old_ifs
@@ -1751,9 +2312,6 @@ network_initialize()
         return 0
     fi
     network_require_commands || return
-
-    NETWORK_CONTROL_DIR=${TMPDIR:-/tmp}/zstd-splitter-control-${USER:-user}
-    mkdir -p "$NETWORK_CONTROL_DIR" 2>/dev/null || :
 }
 
 network_count_remotes()
@@ -1768,6 +2326,10 @@ network_count_remotes()
 parse_remote_spec()
 {
     remote_spec=$1
+    contains_control_characters "$remote_spec" && {
+        print_error "remote specifications containing control characters are refused"
+        return 2
+    }
     case $remote_spec in
         *']:'*)
             REMOTE_TARGET=${remote_spec%%]:*}]
@@ -1782,26 +2344,94 @@ parse_remote_spec()
             return 2
             ;;
     esac
-    [ -n "$REMOTE_TARGET" ] && [ -n "$REMOTE_PATH" ] || {
-        print_error "invalid remote specification: $remote_spec"
+    validate_remote_target "$REMOTE_TARGET" || {
+        print_error "unsafe or invalid SSH destination: $REMOTE_TARGET"
         return 2
     }
-    case $REMOTE_PATH in
-        /*) ;;
-        *) print_error "remote path must be absolute: $REMOTE_PATH"; return 2 ;;
-    esac
-    case $REMOTE_PATH in *'
-'*) print_error "remote paths containing newlines are refused"; return 2 ;; esac
+    validate_remote_path "$REMOTE_PATH" || {
+        print_error "unsafe or invalid absolute remote path: $REMOTE_PATH"
+        return 2
+    }
 }
 
 shell_quote()
 {
-    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
+    # POSIX single-quote escaping: ' becomes '\'' inside a quoted word.
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
 sftp_quote()
 {
+    contains_control_characters "$1" && {
+        print_error "SFTP paths containing tabs or line breaks are refused"
+        return 1
+    }
     printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
+register_network_target()
+{
+    network_target_value=$1
+    case "
+$NETWORK_CONNECTED_TARGETS
+" in *"
+$network_target_value
+"*) return 0 ;; esac
+    if [ -n "$NETWORK_CONNECTED_TARGETS" ]; then
+        NETWORK_CONNECTED_TARGETS=$(printf '%s\n%s' "$NETWORK_CONNECTED_TARGETS" "$network_target_value")
+    else
+        NETWORK_CONNECTED_TARGETS=$network_target_value
+    fi
+}
+
+clear_active_stage()
+{
+    active_target=${1-}; active_dir=${2-}
+    if [ "$ACTIVE_STAGE_TARGET" = "$active_target" ] && [ "$ACTIVE_STAGE_DIR" = "$active_dir" ]; then
+        ACTIVE_STAGE_TARGET=
+        ACTIVE_STAGE_DIR=
+        ACTIVE_STAGE_LOCK=
+    fi
+}
+
+network_abort_active_stage()
+{
+    [ -n "$ACTIVE_STAGE_TARGET" ] && [ -n "$ACTIVE_STAGE_DIR" ] || return 0
+    abort_saved_target=$ACTIVE_STAGE_TARGET
+    abort_saved_dir=$ACTIVE_STAGE_DIR
+    abort_saved_lock=$ACTIVE_STAGE_LOCK
+    ACTIVE_STAGE_TARGET=
+    ACTIVE_STAGE_DIR=
+    ACTIVE_STAGE_LOCK=
+    network_stage_abort "$abort_saved_target" "$abort_saved_dir" "$abort_saved_lock" || :
+}
+
+network_close_control_masters()
+{
+    [ "$NET_DRY_RUN" != yes ] || return 0
+    [ "$NET_CONTROL_MASTER" != no ] || return 0
+    [ -n "$NETWORK_CONTROL_DIR" ] && [ -d "$NETWORK_CONTROL_DIR" ] || return 0
+    command -v ssh >/dev/null 2>&1 || return 0
+    close_targets=$NETWORK_CONNECTED_TARGETS
+    close_old_ifs=$IFS
+    IFS='
+'
+    set -f
+    for close_target in $close_targets
+    do
+        [ -n "$close_target" ] || continue
+        set -- ssh -q -o BatchMode=yes -o RequestTTY=no \
+            -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes \
+            -o PermitLocalCommand=no -o "ControlPath=$NETWORK_CONTROL_DIR/%C" -O exit
+        [ -z "$NET_IDENTITY" ] || set -- "$@" -o IdentitiesOnly=yes -i "$NET_IDENTITY"
+        [ -z "$NET_PORT" ] || set -- "$@" -p "$NET_PORT"
+        [ -z "$NET_JUMP" ] || set -- "$@" -J "$NET_JUMP"
+        case $NET_ADDRESS_FAMILY in inet) set -- "$@" -4 ;; inet6) set -- "$@" -6 ;; esac
+        "$@" "$close_target" >/dev/null 2>&1 || :
+    done
+    set +f
+    IFS=$close_old_ifs
+    NETWORK_CONNECTED_TARGETS=
 }
 
 network_print_command()
@@ -1820,7 +2450,13 @@ ssh_run()
 {
     ssh_destination=$1
     ssh_command=$2
+    validate_remote_target "$ssh_destination" || {
+        print_error "unsafe SSH destination: $ssh_destination"
+        return 2
+    }
     set -- ssh -o BatchMode=yes -o RequestTTY=no \
+        -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes \
+        -o PermitLocalCommand=no -o EscapeChar=none \
         -o "ConnectTimeout=$NET_CONNECT_TIMEOUT" \
         -o "ServerAliveInterval=$NET_KEEPALIVE_INTERVAL" \
         -o "ServerAliveCountMax=$NET_KEEPALIVE_COUNT" \
@@ -1830,7 +2466,7 @@ ssh_run()
         -o "ControlPersist=$NET_CONTROL_PERSIST" \
         -o "ControlPath=$NETWORK_CONTROL_DIR/%C"
     [ -z "$NET_KNOWN_HOSTS" ] || set -- "$@" -o "UserKnownHostsFile=$NET_KNOWN_HOSTS"
-    [ -z "$NET_IDENTITY" ] || set -- "$@" -i "$NET_IDENTITY"
+    if [ -n "$NET_IDENTITY" ]; then set -- "$@" -o IdentitiesOnly=yes -i "$NET_IDENTITY"; fi
     [ -z "$NET_PORT" ] || set -- "$@" -p "$NET_PORT"
     [ -z "$NET_JUMP" ] || set -- "$@" -J "$NET_JUMP"
     case $NET_ADDRESS_FAMILY in inet) set -- "$@" -4 ;; inet6) set -- "$@" -6 ;; esac
@@ -1838,6 +2474,7 @@ ssh_run()
     [ -z "$NET_BIND_ADDRESS" ] || set -- "$@" -b "$NET_BIND_ADDRESS"
     set -- "$@" "$ssh_destination" "$ssh_command"
     if [ "$NET_DRY_RUN" = yes ]; then network_print_command "$@"; return 0; fi
+    register_network_target "$ssh_destination"
     "$@"
 }
 
@@ -1845,8 +2482,13 @@ sftp_run_batch()
 {
     sftp_destination=$1
     sftp_batch=$2
+    validate_remote_target "$sftp_destination" || {
+        print_error "unsafe SFTP destination: $sftp_destination"
+        return 2
+    }
     set -- sftp -q -b "$sftp_batch" -B "$NET_SFTP_BUFFER" -R "$NET_SFTP_REQUESTS" \
-        -o BatchMode=yes \
+        -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no \
+        -o ClearAllForwardings=yes -o PermitLocalCommand=no \
         -o "ConnectTimeout=$NET_CONNECT_TIMEOUT" \
         -o "ServerAliveInterval=$NET_KEEPALIVE_INTERVAL" \
         -o "ServerAliveCountMax=$NET_KEEPALIVE_COUNT" \
@@ -1857,7 +2499,7 @@ sftp_run_batch()
         -o "ControlPath=$NETWORK_CONTROL_DIR/%C"
     [ "$NET_BANDWIDTH" -eq 0 ] || set -- "$@" -l "$NET_BANDWIDTH"
     [ -z "$NET_KNOWN_HOSTS" ] || set -- "$@" -o "UserKnownHostsFile=$NET_KNOWN_HOSTS"
-    [ -z "$NET_IDENTITY" ] || set -- "$@" -i "$NET_IDENTITY"
+    if [ -n "$NET_IDENTITY" ]; then set -- "$@" -o IdentitiesOnly=yes -i "$NET_IDENTITY"; fi
     [ -z "$NET_PORT" ] || set -- "$@" -P "$NET_PORT"
     [ -z "$NET_JUMP" ] || set -- "$@" -J "$NET_JUMP"
     case $NET_ADDRESS_FAMILY in inet) set -- "$@" -4 ;; inet6) set -- "$@" -6 ;; esac
@@ -1867,6 +2509,7 @@ sftp_run_batch()
         sed 's/^/[dry-run sftp] /' "$sftp_batch"
         return 0
     fi
+    register_network_target "$sftp_destination"
     "$@"
 }
 
@@ -1914,7 +2557,20 @@ sftp_get_one()
 # -----------------------------------------------------------------------------
 json_escape()
 {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+    ZSS_JSON_VALUE=$1
+    export ZSS_JSON_VALUE
+    awk 'BEGIN {
+        value = ENVIRON["ZSS_JSON_VALUE"]
+        for (i = 1; i < 32; i++) control[sprintf("%c", i)] = sprintf("\\u%04x", i)
+        for (i = 1; i <= length(value); i++) {
+            c = substr(value, i, 1)
+            if (c == "\\") printf "\\\\"
+            else if (c == "\"") printf "\\\""
+            else if (c in control) printf "%s", control[c]
+            else printf "%s", c
+        }
+    }' 
+    unset ZSS_JSON_VALUE
 }
 
 audit_event()
@@ -1931,12 +2587,16 @@ audit_event()
 
 network_transfer_id()
 {
-    printf '%s-%s\n' "$(date -u '+%Y%m%dT%H%M%SZ')" "$$"
+    make_network_temp_dir || return 1
+    transfer_token_file=$(mktemp "$NETWORK_TEMP_DIR/transfer-id.XXXXXX") || return 1
+    transfer_token=${transfer_token_file##*.}
+    rm -f "$transfer_token_file"
+    printf '%s-%s-%s\n' "$(date -u '+%Y%m%dT%H%M%SZ')" "$$" "$transfer_token"
 }
 
 network_prepare_local_set()
 {
-    transfer_input=$1
+    transfer_input=$(absolute_existing_path "$1") || { print_error "cannot resolve network input: $1"; return 1; }
     make_network_temp_dir || return 1
     NETWORK_FILE_LIST=$NETWORK_TEMP_DIR/local-files.$$.list
     : >"$NETWORK_FILE_LIST"
@@ -1963,7 +2623,7 @@ network_prepare_local_set()
                 printf '%s\n' "$transfer_file" >>"$NETWORK_FILE_LIST"
                 [ -n "$NETWORK_SELECTED_PART" ] || NETWORK_SELECTED_PART=$transfer_file
             done <"$NETWORK_TEMP_DIR/suffixes.$$.list"
-            rm -rf "$WORK_DIR"; WORK_DIR=
+            safe_remove_tree "$WORK_DIR"; WORK_DIR=
             printf '%s\n' "$NETWORK_MANIFEST_PATH" >>"$NETWORK_FILE_LIST"
         else
             [ "$NET_ALLOW_UNVERIFIED" = yes ] || {
@@ -1982,7 +2642,7 @@ network_prepare_local_set()
             NETWORK_MANIFEST_PATH=$(resolve_manifest "$transfer_input" archive)
             make_work_dir "$(dirname "$transfer_input")"
             validate_archive_against_manifest "$transfer_input" "$detected_engine" "$NETWORK_MANIFEST_PATH" || return 1
-            rm -rf "$WORK_DIR"; WORK_DIR=
+            safe_remove_tree "$WORK_DIR"; WORK_DIR=
             printf '%s\n' "$NETWORK_MANIFEST_PATH" >>"$NETWORK_FILE_LIST"
         elif [ "$NET_ALLOW_UNVERIFIED" != yes ]; then
             print_error "network transfer requires -i or -O allow-unverified=yes"
@@ -2051,9 +2711,19 @@ network_remote_preflight()
     preflight_spec=$1
     parse_remote_spec "$preflight_spec" || return
     preflight_engine_command=$(engine_command "$NETWORK_ENGINE" 2>/dev/null || :)
-    preflight_commands="sh tar split cat mkdir rm mv dirname basename mkfifo awk wc tr sha256sum cmp readlink"
+    preflight_commands="sh tar split cat mkdir rm mv dirname basename mkfifo awk wc tr cmp readlink sha256sum"
     [ -z "$preflight_engine_command" ] || preflight_commands="$preflight_commands $preflight_engine_command"
-    preflight_script='set -eu; for c in '$preflight_commands'; do command -v "$c" >/dev/null 2>&1 || { echo "missing remote command: $c" >&2; exit 1; }; done; test -w '$(shell_quote "$REMOTE_PATH")' 2>/dev/null || { mkdir -p '$(shell_quote "$REMOTE_PATH")'; test -w '$(shell_quote "$REMOTE_PATH")'; }'
+    preflight_script=$(cat <<EOF_REMOTE_PREFLIGHT
+set -eu
+umask 077
+ENV= BASH_ENV= CDPATH=
+export ENV BASH_ENV CDPATH
+for c in $preflight_commands; do
+    command -v "\$c" >/dev/null 2>&1 || { echo "missing remote command: \$c" >&2; exit 1; }
+done
+test -w $(shell_quote "$REMOTE_PATH") 2>/dev/null || { mkdir -p $(shell_quote "$REMOTE_PATH"); test -w $(shell_quote "$REMOTE_PATH"); }
+EOF_REMOTE_PREFLIGHT
+)
     ssh_run "$REMOTE_TARGET" "$preflight_script"
 }
 
@@ -2061,6 +2731,10 @@ network_stage_begin()
 {
     stage_spec=$1; archive_name=$2
     parse_remote_spec "$stage_spec" || return
+    contains_control_characters "$archive_name" && {
+        print_error "archive names containing control characters cannot be published remotely"
+        return 2
+    }
     STAGE_TARGET=$REMOTE_TARGET
     STAGE_ROOT=$REMOTE_PATH
     STAGE_ID=$(network_transfer_id)
@@ -2070,21 +2744,34 @@ network_stage_begin()
     q_root=$(shell_quote "$STAGE_ROOT")
     q_stage=$(shell_quote "$STAGE_DIR")
     q_lock=$(shell_quote "$STAGE_LOCK")
-    stage_command="set -eu; mkdir -p $q_root $(shell_quote "$STAGE_ROOT/.zstd-splitter.incoming") $(shell_quote "$STAGE_ROOT/.zstd-splitter.locks")"
+    q_incoming=$(shell_quote "$STAGE_ROOT/.zstd-splitter.incoming")
+    q_locks=$(shell_quote "$STAGE_ROOT/.zstd-splitter.locks")
+    stage_command="set -eu; umask 077; mkdir -p $q_root $q_incoming $q_locks"
     if [ "$NET_LOCK" = yes ]; then
         stage_command="$stage_command; mkdir $q_lock"
     fi
-    stage_command="$stage_command; mkdir -p $q_stage"
-    ssh_run "$STAGE_TARGET" "$stage_command"
+    stage_command="$stage_command; if ! mkdir $q_stage; then rmdir $q_lock 2>/dev/null || :; exit 1; fi"
+    if ssh_run "$STAGE_TARGET" "$stage_command"; then
+        ACTIVE_STAGE_TARGET=$STAGE_TARGET
+        ACTIVE_STAGE_DIR=$STAGE_DIR
+        ACTIVE_STAGE_LOCK=$STAGE_LOCK
+        return 0
+    else
+        stage_status=$?
+        return "$stage_status"
+    fi
 }
 
 network_stage_abort()
 {
     abort_target=$1; abort_stage=$2; abort_lock=$3
     abort_command=
-    [ "$NET_CLEANUP" = always ] && abort_command="rm -rf $(shell_quote "$abort_stage");"
+    if [ "$NET_CLEANUP" != never ]; then
+        abort_command="rm -rf $(shell_quote "$abort_stage");"
+    fi
     abort_command="$abort_command rmdir $(shell_quote "$abort_lock") 2>/dev/null || :"
     ssh_run "$abort_target" "$abort_command" || :
+    clear_active_stage "$abort_target" "$abort_stage"
 }
 
 network_upload_file_to_stage()
@@ -2115,18 +2802,19 @@ network_upload_list_parallel()
     while IFS= read -r parallel_file; do
         network_upload_file_to_stage "$parallel_target" "$parallel_stage" "$parallel_file" &
         parallel_pid=$!
+        register_child_pid "$parallel_pid"
         parallel_pids="$parallel_pids $parallel_pid"
         parallel_count=$((parallel_count + 1))
         if [ "$parallel_count" -ge "$NET_JOBS" ]; then
             parallel_old_ifs=$IFS; IFS=' '
-            for parallel_pid in $parallel_pids; do wait "$parallel_pid" || parallel_status=1; done
+            for parallel_pid in $parallel_pids; do wait "$parallel_pid" || parallel_status=1; unregister_child_pid "$parallel_pid"; done
             IFS=$parallel_old_ifs
             [ "$parallel_status" -eq 0 ] || return 1
             parallel_pids=; parallel_count=0
         fi
     done <"$parallel_list"
     parallel_old_ifs=$IFS; IFS=' '
-    for parallel_pid in $parallel_pids; do wait "$parallel_pid" || parallel_status=1; done
+    for parallel_pid in $parallel_pids; do wait "$parallel_pid" || parallel_status=1; unregister_child_pid "$parallel_pid"; done
     IFS=$parallel_old_ifs
     [ "$parallel_status" -eq 0 ]
 }
@@ -2138,7 +2826,6 @@ network_remote_helper_action()
     helper_target=$1; helper_stage=$2; helper_selected=$3; helper_manifest=$4
     helper_name=.zstd-splitter-helper.sh
     network_upload_file_to_stage "$helper_target" "$helper_stage" "$SELF_PATH" || return 1
-    # The uploaded script keeps its local basename. Rename it to a predictable helper name.
     uploaded_self=$helper_stage/$(basename "$SELF_PATH")
     ssh_run "$helper_target" "mv -f $(shell_quote "$uploaded_self") $(shell_quote "$helper_stage/$helper_name")" || return 1
 
@@ -2146,14 +2833,14 @@ network_remote_helper_action()
     q_helper=$(shell_quote "./$helper_name")
     q_selected=$(shell_quote "$helper_selected")
     q_manifest=$(shell_quote "$helper_manifest")
-    remote_command="set -eu; cd $q_stage; sh $q_helper -v -i -m $q_manifest $q_selected"
+    remote_command="set -eu; umask 077; cd $q_stage; ENV= BASH_ENV= CDPATH= sh $q_helper -v -i -m $q_manifest $q_selected"
     case $NET_RETAIN in
-        archive|all) remote_command="$remote_command; sh $q_helper -j -i -f -m $q_manifest $q_selected" ;;
+        archive|all) remote_command="$remote_command; ENV= BASH_ENV= CDPATH= sh $q_helper -j -i -f -m $q_manifest $q_selected" ;;
     esac
     if [ -n "$NET_REMOTE_EXTRACT" ]; then
-        remote_command="$remote_command; sh $q_helper -x -i -f -m $q_manifest -d .extracted $q_selected"
+        remote_command="$remote_command; ENV= BASH_ENV= CDPATH= sh $q_helper -x -i -f -m $q_manifest -d .extracted $q_selected"
     elif [ "$NET_REMOTE_VERIFY" = content ] || [ "$NET_REMOTE_VERIFY" = all ]; then
-        remote_command="$remote_command; sh $q_helper -x -i -f -m $q_manifest -d .verify-extracted $q_selected; rm -rf .verify-extracted"
+        remote_command="$remote_command; ENV= BASH_ENV= CDPATH= sh $q_helper -x -i -f -m $q_manifest -d .verify-extracted $q_selected; rm -rf .verify-extracted"
     fi
     if [ "$NET_RETAIN" = parts ]; then
         remote_archive=${helper_selected%.part.??????}
@@ -2163,35 +2850,136 @@ network_remote_helper_action()
     ssh_run "$helper_target" "$remote_command"
 }
 
-# Publishes a verified staging directory atomically and releases its lock.
 network_stage_publish()
 {
     publish_target=$1; publish_root=$2; publish_stage=$3; publish_bundle=$4; publish_lock=$5; publish_archive=$6
-    if [ -n "$NET_REMOTE_EXTRACT" ]; then
-        if [ "$NET_REMOTE_EXTRACT" = auto ]; then
-            publish_extract=$publish_root/$publish_archive.extracted
-        else
-            publish_extract=$NET_REMOTE_EXTRACT
-        fi
-        replace_extract=
-        if [ "$FORCE" -eq 1 ]; then replace_extract="rm -rf $(shell_quote "$publish_extract");"; fi
-        ssh_run "$publish_target" "set -eu; $replace_extract test ! -e $(shell_quote "$publish_extract"); mkdir -p $(shell_quote "$(dirname "$publish_extract")"); mv $(shell_quote "$publish_stage/.extracted") $(shell_quote "$publish_extract")" || return 1
-    fi
+    publish_token=${publish_stage##*/}
+    publish_backup=$publish_root/.zstd-splitter.backup.$publish_archive.$publish_token
+    q_stage=$(shell_quote "$publish_stage")
+    q_bundle=$(shell_quote "$publish_bundle")
+    q_lock=$(shell_quote "$publish_lock")
+    q_backup=$(shell_quote "$publish_backup")
+    force_flag=$FORCE
 
-    if [ "$NET_ATOMIC" = yes ]; then
-        replace_bundle=
-        if [ "$FORCE" -eq 1 ]; then replace_bundle="rm -rf $(shell_quote "$publish_bundle");"; fi
-        publish_command="set -eu; $replace_bundle test ! -e $(shell_quote "$publish_bundle"); mv $(shell_quote "$publish_stage") $(shell_quote "$publish_bundle")"
+    if [ -n "$NET_REMOTE_EXTRACT" ]; then
+        if [ "$NET_REMOTE_EXTRACT" = auto ]; then publish_extract=$publish_root/$publish_archive.extracted; else publish_extract=$NET_REMOTE_EXTRACT; fi
+        validate_remote_extract_path "$publish_extract" || { print_error "unsafe remote extraction destination: $publish_extract"; return 2; }
+        publish_extract_backup=$publish_extract.zstd-splitter-backup.$publish_token
+        q_extract=$(shell_quote "$publish_extract")
+        q_extract_backup=$(shell_quote "$publish_extract_backup")
+        q_extract_parent=$(shell_quote "$(dirname "$publish_extract")")
+        publish_command=$(cat <<EOF_REMOTE_PUBLISH
+set -eu
+umask 077
+stage=$q_stage
+bundle=$q_bundle
+lock=$q_lock
+backup=$q_backup
+extract=$q_extract
+extract_backup=$q_extract_backup
+extract_parent=$q_extract_parent
+force=$force_flag
+bundle_backed=0
+bundle_installed=0
+extract_backed=0
+extract_installed=0
+rollback()
+{
+    [ "\$bundle_installed" -eq 0 ] || rm -rf "\$bundle"
+    [ "\$bundle_backed" -eq 0 ] || mv "\$backup" "\$bundle"
+    [ "\$extract_installed" -eq 0 ] || rm -rf "\$extract"
+    [ "\$extract_backed" -eq 0 ] || mv "\$extract_backup" "\$extract"
+    rmdir "\$lock" 2>/dev/null || :
+}
+finish()
+{
+    status=\$?
+    trap - 0 1 2 3 15
+    [ "\$status" -eq 0 ] || rollback
+    exit "\$status"
+}
+trap finish 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 131' 3
+trap 'exit 143' 15
+mkdir -p "\$extract_parent"
+if [ -e "\$bundle" ]; then [ "\$force" -eq 1 ] || exit 1; mv "\$bundle" "\$backup"; bundle_backed=1; fi
+if [ -e "\$extract" ]; then [ "\$force" -eq 1 ] || exit 1; mv "\$extract" "\$extract_backup"; extract_backed=1; fi
+mv "\$stage/.extracted" "\$extract"; extract_installed=1
+mv "\$stage" "\$bundle"; bundle_installed=1
+rm -rf "\$backup" "\$extract_backup"
+rmdir "\$lock" 2>/dev/null || :
+trap - 0 1 2 3 15
+EOF_REMOTE_PUBLISH
+)
+    elif [ "$NET_ATOMIC" = yes ]; then
+        publish_command=$(cat <<EOF_REMOTE_PUBLISH
+set -eu
+umask 077
+stage=$q_stage
+bundle=$q_bundle
+lock=$q_lock
+backup=$q_backup
+force=$force_flag
+bundle_backed=0
+bundle_installed=0
+rollback()
+{
+    [ "\$bundle_installed" -eq 0 ] || rm -rf "\$bundle"
+    [ "\$bundle_backed" -eq 0 ] || mv "\$backup" "\$bundle"
+    rmdir "\$lock" 2>/dev/null || :
+}
+finish()
+{
+    status=\$?
+    trap - 0 1 2 3 15
+    [ "\$status" -eq 0 ] || rollback
+    exit "\$status"
+}
+trap finish 0
+trap 'exit 129' 1
+trap 'exit 130' 2
+trap 'exit 131' 3
+trap 'exit 143' 15
+if [ -e "\$bundle" ]; then [ "\$force" -eq 1 ] || exit 1; mv "\$bundle" "\$backup"; bundle_backed=1; fi
+mv "\$stage" "\$bundle"; bundle_installed=1
+rm -rf "\$backup"
+rmdir "\$lock" 2>/dev/null || :
+trap - 0 1 2 3 15
+EOF_REMOTE_PUBLISH
+)
     else
-        publish_command="set -eu; for f in $(shell_quote "$publish_stage")/*; do mv \"\$f\" $(shell_quote "$publish_root")/; done; rmdir $(shell_quote "$publish_stage")"
+        q_root=$(shell_quote "$publish_root")
+        publish_command=$(cat <<EOF_REMOTE_PUBLISH
+set -eu
+umask 077
+stage=$q_stage
+root=$q_root
+lock=$q_lock
+force=$force_flag
+for f in "\$stage"/* "\$stage"/.[!.]* "\$stage"/..?*
+do
+    [ -e "\$f" ] || [ -L "\$f" ] || continue
+    name=\${f##*/}
+    final=\$root/\$name
+    if [ -e "\$final" ] || [ -L "\$final" ]; then [ "\$force" -eq 1 ] || exit 1; rm -rf "\$final"; fi
+    mv "\$f" "\$final"
+done
+rmdir "\$stage"
+rmdir "\$lock" 2>/dev/null || :
+EOF_REMOTE_PUBLISH
+)
     fi
-    publish_command="$publish_command; rmdir $(shell_quote "$publish_lock") 2>/dev/null || :"
-    ssh_run "$publish_target" "$publish_command"
+    if ssh_run "$publish_target" "$publish_command"; then
+        clear_active_stage "$publish_target" "$publish_stage"
+        return 0
+    else
+        publish_status=$?
+        return "$publish_status"
+    fi
 }
 
-# -----------------------------------------------------------------------------
-# Push, fan-out/quorum, and pull orchestration
-# -----------------------------------------------------------------------------
 network_push_one()
 {
     push_spec=$1; push_input=$2
@@ -2219,14 +3007,23 @@ network_push_one()
             # Complete archive: remote native and manifest verification through helper.
             archive_base=$NETWORK_ARCHIVE_NAME
             manifest_base=$(basename "$NETWORK_MANIFEST_PATH")
-            network_upload_file_to_stage "$STAGE_TARGET" "$STAGE_DIR" "$SELF_PATH" || return 1
+            network_upload_file_to_stage "$STAGE_TARGET" "$STAGE_DIR" "$SELF_PATH" || {
+                network_stage_abort "$STAGE_TARGET" "$STAGE_DIR" "$STAGE_LOCK" || :
+                audit_event push failed "$push_spec"
+                return 1
+            }
             uploaded_self=$STAGE_DIR/$(basename "$SELF_PATH")
-            remote_cmd="set -eu; cd $(shell_quote "$STAGE_DIR"); sh $(shell_quote "./$(basename "$SELF_PATH")") -v -i -m $(shell_quote "$manifest_base") $(shell_quote "$archive_base"); rm -f $(shell_quote "./$(basename "$SELF_PATH")")"
-            ssh_run "$STAGE_TARGET" "$remote_cmd" || return 1
+            remote_cmd="set -eu; umask 077; cd $(shell_quote "$STAGE_DIR"); ENV= BASH_ENV= CDPATH= sh $(shell_quote "./$(basename "$SELF_PATH")") -v -i -m $(shell_quote "$manifest_base") $(shell_quote "$archive_base"); rm -f $(shell_quote "./$(basename "$SELF_PATH")")"
+            ssh_run "$STAGE_TARGET" "$remote_cmd" || {
+                network_stage_abort "$STAGE_TARGET" "$STAGE_DIR" "$STAGE_LOCK" || :
+                audit_event push failed "$push_spec"
+                return 1
+            }
         fi
     fi
 
     network_stage_publish "$STAGE_TARGET" "$STAGE_ROOT" "$STAGE_DIR" "$STAGE_BUNDLE" "$STAGE_LOCK" "$NETWORK_ARCHIVE_NAME" || {
+        network_stage_abort "$STAGE_TARGET" "$STAGE_DIR" "$STAGE_LOCK" || :
         audit_event push failed "$push_spec"
         return 1
     }
@@ -2259,6 +3056,31 @@ network_push_many()
     [ "$push_success" -ge "$push_required" ]
 }
 
+resolve_pull_destination()
+{
+    pull_destination_input=${1:-.}
+    if [ "$pull_destination_input" = . ]; then
+        pwd -P
+        return
+    fi
+    case $pull_destination_input in /*) pull_destination_abs=$pull_destination_input ;; *) pull_destination_abs=$(pwd -P)/$pull_destination_input ;; esac
+    if [ -e "$pull_destination_abs" ] || [ -L "$pull_destination_abs" ]; then
+        [ -d "$pull_destination_abs" ] && [ ! -L "$pull_destination_abs" ] || return 1
+        (cd "$pull_destination_abs" 2>/dev/null && pwd -P)
+        return
+    fi
+    pull_parent=$(dirname "$pull_destination_abs")
+    pull_base=$(basename "$pull_destination_abs")
+    case $pull_base in ''|.|..) return 1 ;; esac
+    case "/$pull_destination_abs/" in */../*|*/./*) return 1 ;; esac
+    mkdir -p "$pull_parent" || return 1
+    pull_parent=$(cd "$pull_parent" 2>/dev/null && pwd -P) || return 1
+    pull_destination_abs=${pull_parent%/}/$pull_base
+    mkdir "$pull_destination_abs" || return 1
+    chmod 700 "$pull_destination_abs" 2>/dev/null || :
+    printf '%s\n' "$pull_destination_abs"
+}
+
 network_pull()
 {
     pull_spec=$1
@@ -2266,58 +3088,64 @@ network_pull()
     pull_target=$REMOTE_TARGET
     pull_remote_input=$REMOTE_PATH
     pull_destination=${DESTINATION:-.}
-    mkdir -p "$pull_destination"
-    pull_destination=$(cd "$pull_destination" 2>/dev/null && pwd -P) || return 1
+    pull_destination=$(resolve_pull_destination "$pull_destination") || {
+        print_error "unsafe pull destination: $pull_destination"
+        return 1
+    }
+    [ -d "$pull_destination" ] || mkdir -p "$pull_destination"
     make_network_temp_dir || return 1
-    pull_stage=$pull_destination/.zstd-splitter.incoming
-    mkdir -p "$pull_stage"
+    old_umask=$(umask); umask 077
+    pull_stage=$(mktemp -d "$pull_destination/.zstd-splitter-pull.XXXXXX" 2>/dev/null || :)
+    umask "$old_umask"
+    [ -n "$pull_stage" ] || { print_error "cannot create private pull staging directory"; return 1; }
 
+    saved_manifest_file=$MANIFEST_FILE
+    MANIFEST_FILE=
+    pull_result=1
     if detect_engine_from_part "$pull_remote_input" >/dev/null 2>&1; then
         pull_remote_prefix=${pull_remote_input%??????}
         pull_remote_archive=${pull_remote_prefix%.part.}
         pull_remote_manifest=$pull_remote_archive.manifest.sha256
-        pull_manifest_local=$pull_stage/$(basename "$pull_remote_manifest").partial
-        network_retry network_get_one "$pull_target" "$pull_remote_manifest" "$pull_manifest_local" || return 1
-        pull_manifest_final=${pull_manifest_local%.partial}
-        mv -f "$pull_manifest_local" "$pull_manifest_final"
-        make_work_dir "$pull_destination"
-        validate_manifest_structure "$pull_manifest_final" || return 1
-        rm -rf "$WORK_DIR"; WORK_DIR=
+        pull_manifest_final=$pull_stage/$(basename "$pull_remote_manifest")
+        pull_manifest_partial=$pull_manifest_final.partial
+        network_retry network_get_one "$pull_target" "$pull_remote_manifest" "$pull_manifest_partial" || { MANIFEST_FILE=$saved_manifest_file; safe_remove_tree "$pull_stage"; return 1; }
+        mv "$pull_manifest_partial" "$pull_manifest_final"
+        make_work_dir "$pull_stage"
+        validate_manifest_structure "$pull_manifest_final" || { MANIFEST_FILE=$saved_manifest_file; safe_remove_tree "$pull_stage"; return 1; }
+        safe_remove_tree "$WORK_DIR"; WORK_DIR=
         pull_local_prefix=$pull_stage/$(basename "$pull_remote_prefix")
         pull_first=
         awk -F '\t' '$1 == "part" { print $2 }' "$pull_manifest_final" >"$NETWORK_TEMP_DIR/pull-suffixes.$$.list"
         while IFS= read -r pull_suffix; do
             pull_remote_file=$pull_remote_prefix$pull_suffix
-            pull_local_partial=$pull_local_prefix$pull_suffix.partial
-            network_retry network_get_one "$pull_target" "$pull_remote_file" "$pull_local_partial" || return 1
-            pull_local_final=${pull_local_partial%.partial}
-            mv -f "$pull_local_partial" "$pull_local_final"
+            pull_local_final=$pull_local_prefix$pull_suffix
+            pull_local_partial=$pull_local_final.partial
+            network_retry network_get_one "$pull_target" "$pull_remote_file" "$pull_local_partial" || { MANIFEST_FILE=$saved_manifest_file; safe_remove_tree "$pull_stage"; return 1; }
+            mv "$pull_local_partial" "$pull_local_final"
             [ -n "$pull_first" ] || pull_first=$pull_local_final
         done <"$NETWORK_TEMP_DIR/pull-suffixes.$$.list"
-        mv -f "$pull_manifest_final" "$pull_destination/$(basename "$pull_manifest_final")"
-        for pull_file in "$pull_local_prefix"??????; do [ -f "$pull_file" ] && mv -f "$pull_file" "$pull_destination/$(basename "$pull_file")"; done
-        pull_first=$pull_destination/$(basename "$pull_first")
-        verify_input "$pull_first" || return 1
+        verify_input "$pull_first" || { MANIFEST_FILE=$saved_manifest_file; safe_remove_tree "$pull_stage"; return 1; }
+        publish_staged_files "$pull_stage" "$pull_destination" || { MANIFEST_FILE=$saved_manifest_file; return 1; }
         print_info "Remote part set downloaded and verified in: $pull_destination"
+        pull_result=0
     else
-        detect_engine_from_archive "$pull_remote_input" >/dev/null 2>&1 || { print_error "unsupported remote input"; return 2; }
+        detect_engine_from_archive "$pull_remote_input" >/dev/null 2>&1 || { MANIFEST_FILE=$saved_manifest_file; safe_remove_tree "$pull_stage"; print_error "unsupported remote input"; return 2; }
         pull_remote_manifest=$pull_remote_input.manifest.sha256
-        pull_local_archive=$pull_stage/$(basename "$pull_remote_input").partial
-        pull_local_manifest=$pull_stage/$(basename "$pull_remote_manifest").partial
-        network_retry network_get_one "$pull_target" "$pull_remote_input" "$pull_local_archive" || return 1
-        network_retry network_get_one "$pull_target" "$pull_remote_manifest" "$pull_local_manifest" || return 1
-        pull_archive_final=$pull_destination/$(basename "$pull_remote_input")
-        pull_manifest_final=$pull_destination/$(basename "$pull_remote_manifest")
-        mv -f "$pull_local_archive" "$pull_archive_final"
-        mv -f "$pull_local_manifest" "$pull_manifest_final"
-        verify_input "$pull_archive_final" || return 1
-        print_info "Remote archive downloaded and verified: $pull_archive_final"
+        pull_local_archive=$pull_stage/$(basename "$pull_remote_input")
+        pull_local_manifest=$pull_stage/$(basename "$pull_remote_manifest")
+        network_retry network_get_one "$pull_target" "$pull_remote_input" "$pull_local_archive.partial" || { MANIFEST_FILE=$saved_manifest_file; safe_remove_tree "$pull_stage"; return 1; }
+        network_retry network_get_one "$pull_target" "$pull_remote_manifest" "$pull_local_manifest.partial" || { MANIFEST_FILE=$saved_manifest_file; safe_remove_tree "$pull_stage"; return 1; }
+        mv "$pull_local_archive.partial" "$pull_local_archive"
+        mv "$pull_local_manifest.partial" "$pull_local_manifest"
+        verify_input "$pull_local_archive" || { MANIFEST_FILE=$saved_manifest_file; safe_remove_tree "$pull_stage"; return 1; }
+        publish_staged_files "$pull_stage" "$pull_destination" || { MANIFEST_FILE=$saved_manifest_file; return 1; }
+        print_info "Remote archive downloaded and verified in: $pull_destination"
+        pull_result=0
     fi
+    MANIFEST_FILE=$saved_manifest_file
+    return "$pull_result"
 }
 
-# -----------------------------------------------------------------------------
-# Network diagnostics and administrative queries
-# -----------------------------------------------------------------------------
 network_print_config()
 {
     cat <<EOF_NETWORK_CONFIG
@@ -2446,7 +3274,7 @@ network_fetch_remote_manifest()
     network_retry network_get_one "$FETCH_TARGET" "$FETCH_MANIFEST" "$FETCH_LOCAL_MANIFEST" || return 1
     make_work_dir "$NETWORK_TEMP_DIR"
     validate_manifest_structure "$FETCH_LOCAL_MANIFEST" || return 1
-    rm -rf "$WORK_DIR"; WORK_DIR=
+    safe_remove_tree "$WORK_DIR"; WORK_DIR=
 }
 
 network_stream_remote_file()
@@ -2462,11 +3290,15 @@ network_stream_remote_file()
     mkfifo "$stream_fifo"
     ssh_run "$stream_src_target" "cat $(shell_quote "$stream_src_path")" >"$stream_fifo" &
     stream_src_pid=$!
+    register_child_pid "$stream_src_pid"
     ssh_run "$stream_dst_target" "cat > $(shell_quote "$stream_dst_path")" <"$stream_fifo" &
     stream_dst_pid=$!
+    register_child_pid "$stream_dst_pid"
     stream_status=0
     wait "$stream_src_pid" || stream_status=1
+    unregister_child_pid "$stream_src_pid"
     wait "$stream_dst_pid" || stream_status=1
+    unregister_child_pid "$stream_dst_pid"
     rm -f "$stream_fifo"
     [ "$stream_status" -eq 0 ]
 }
@@ -2604,6 +3436,7 @@ interactive_mode()
 # action, and preserves documented exit-status semantics.
 main()
 {
+    runtime_sanitize_path || return 1
     if [ "$#" -eq 0 ]; then
         require_base_commands
         interactive_mode
@@ -2659,6 +3492,13 @@ main()
         esac
     done
     shift $((OPTIND - 1))
+
+    if [ -n "$NETWORK_CONFIG" ]; then
+        NETWORK_CONFIG=$(absolute_existing_path "$NETWORK_CONFIG") || { print_error "cannot resolve network configuration file"; return 1; }
+    fi
+    if [ -n "$MANIFEST_FILE" ]; then
+        MANIFEST_FILE=$(absolute_existing_path "$MANIFEST_FILE") || { print_error "cannot resolve manifest file"; return 1; }
+    fi
 
     if [ -z "$ACTION" ]; then
         print_error "one action is required"

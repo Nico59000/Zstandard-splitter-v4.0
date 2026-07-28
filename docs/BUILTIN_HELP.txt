@@ -70,6 +70,11 @@ Examples:
   zstd-splitter.sh -P -i -R backup@nas:/srv/backups archive.tar.zst.part.aaaaaa
   zstd-splitter.sh -G -i -R backup@nas:/srv/backups/archive.tar.zst.bundle/archive.tar.zst.part.aaaaaa -d restored-parts
 
+Runtime-security environment:
+  ZSTD_SPLITTER_PATH     Trusted colon-separated absolute command path.
+  ZSTD_SPLITTER_TMPDIR   Trusted absolute parent for private network state.
+                         Ambient TMPDIR is intentionally ignored.
+
 Compatibility aliases:
   zstd-splitter.sh --help       is accepted as an alias for -h.
   zstd-splitter.sh --engines    is accepted as an alias for -E.

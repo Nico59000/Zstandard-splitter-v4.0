@@ -9,8 +9,8 @@ SSH/SFTP administration. This README is cumulative: it describes the inherited
 
 - **3.0 — strict integrity:** canonical source inventory, compressed-archive SHA-256, per-part SHA-256, reconstruction checks, extraction, and restored-content validation.
 - **4.0 — transactional SSH/SFTP:** push, pull, staging, locking, remote verification, optional remote extraction, and atomic bundle publication.
-- **4.1 future version boundary:** profiles, parallelism, window/buffer tuning, connection-reuse controls, and MTU diagnostics are intentionally unavailable.
-- **4.2 future version boundary:** fan-out, quorum, relay, health, inventory, garbage collection, and JSON Lines audit logging are intentionally unavailable.
+- **4.1 boundary:** profiles, parallelism, window/buffer tuning, connection-reuse controls, and MTU diagnostics are intentionally unavailable.
+- **4.2 boundary:** fan-out, quorum, relay, health, inventory, garbage collection, and JSON Lines audit logging are intentionally unavailable.
 - **4.0 — original feature release:** uses the GNU-oriented dependency profile; use the matching `.1` release for macOS/BSD abstraction.
 
 ## Local archive layer inherited from 3.0
@@ -113,3 +113,25 @@ sh tests/mock-network-test.sh
 
 The mocked SSH/SFTP tests validate deterministic command and transaction behavior;
 they do not claim testing on every physical operating system or network.
+
+
+## Runtime security audit revision
+
+Package revision `runtime-security-audit-r2` incorporates the 2026-07-28
+execution-security review without changing the public feature level of
+version 4.0. It hardens shell quoting, temporary state, signal cleanup,
+extraction staging, manifest ambiguity checks, transactional publication,
+pull verification, remote-stage cleanup, persistent SSH control-session
+cleanup, and terminal-safe diagnostics.
+
+Run:
+
+```sh
+sh tests/runtime-static-audit.sh
+sh tests/runtime-security-test.sh
+```
+
+The complete threat model and residual limits are documented in
+[`docs/RUNTIME-SECURITY.md`](docs/RUNTIME-SECURITY.md). SHA-256 provides
+integrity, not origin authentication; security-sensitive deployments should
+protect or sign manifests independently.

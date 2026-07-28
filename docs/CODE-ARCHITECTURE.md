@@ -1,73 +1,58 @@
 # Code architecture — zstd-splitter 4.0
 
-## Scope
+`src/zstd-splitter.sh` is a POSIX `/bin/sh` program with `FEATURE_LEVEL=40`.
+Later-feature functions may remain in the shared source skeleton, but CLI parsing
+and `network_validate_settings` make them unreachable below their release level.
 
-The executable is a single POSIX `/bin/sh` file. It deliberately keeps local
-archive processing and network orchestration in one source so the same strict
-manifest and codec rules can be reused locally and on a remote helper.
+## Execution layers
 
-- Program version: `4.0`
-- Feature level: `40`
-- Portability maintenance layer: `no`
-- Network profiles/tuning: `no`
-- 4.2 administration layer: `no`
+1. **Process bootstrap** — locale, private umask, hostile environment removal,
+   runtime variables, and feature constants.
+2. **Observer layer** — progress and structured error channels where available;
+   dedicated-descriptor writes are isolated from operation status.
+3. **Runtime-security primitives** — trusted `PATH`, temporary-parent policy,
+   canonical paths, destructive-path guards, child registries, special-object
+   refusal, archive-member validation, and transactional publication helpers.
+4. **Engine and metadata abstraction** — compression registry, levels, thread
+   policy, file-size backend, and SHA-256 backend.
+5. **Strict manifest layer** — canonical source records, scalar uniqueness,
+   per-part hashes, whole-archive hash, and restored-tree comparison.
+6. **Local workflow layer** — compress/split, verify, join, extract, staging,
+   backup, commit, rollback, and signal cleanup.
+7. **Network configuration layer** — option parsing, profile application,
+   capability gates, remote-target/path grammar, and security defaults.
+8. **SSH/SFTP transport layer** — safely quoted remote commands, batch files,
+   retries, partial uploads, receiver-side hash/size verification, and control
+   session tracking.
+9. **Remote transaction layer** — staging, locks, helper verification, optional
+   extraction, atomic publication, active-stage abort, and rollback.
+10. **Administration layer** — only at feature level 42: fan-out, quorum, relay,
+    inventory, health, garbage collection, and audit events.
+11. **CLI dispatcher** — action validation, incompatible-option rejection, and
+    exact operand cardinality.
 
-## Source sections
+## Security-sensitive function groups
 
-1. **CLI and diagnostics** — `usage`, `list_engines`, `print_error`, `print_info`.
-2. **Lifecycle** — traps, dependency checks, temporary directories, overwrite policy.
-3. **Codec registry** — engine aliases, extensions, levels, worker support.
-4. **Portable integrity primitives** — file sizes and SHA-256 adapters.
-5. **Manifest model** — canonical paths, regular files, directories, symbolic links,
-   archive identity, sizes, and aggregate/source hashes.
-6. **Local workflows** — create/split, join, verify, and extract.
-7. **Network configuration** — profiles, `NAME=VALUE` overlays, validation, and gates.
-8. **Transport** — command construction, SFTP batch files, SSH streams, retry/backoff.
-9. **Remote transaction** — preflight, staging, per-file verification, helper validation,
-   atomic publication, cleanup, and pull.
-10. **Advanced network layer** — diagnostics and version-gated administration.
-11. **Entry point** — interactive menu, aliases, `getopts`, and dispatch.
+- `runtime_sanitize_path`, `secure_tmp_parent`, `safe_remove_tree`
+- `source_type_walk`, `validate_archive_members`
+- `publish_staged_files`, `publish_generated_set`
+- `validate_manifest_structure`, `validate_parts_against_manifest`
+- `shell_quote`, `sftp_quote`, `validate_remote_target`, `validate_jump_spec`
+- `network_stage_begin`, `network_stage_abort`, `network_stage_publish`
+- `network_abort_active_stage`, `network_close_control_masters`
+- `cleanup`, `handle_signal`, `terminate_children`
 
-## Important state
+## Maintainer invariants
 
-- `FEATURE_LEVEL` is the executable capability boundary (`40`, `41`, or `42`).
-- `STRICT_INTEGRITY` requires the manifest checks before publication or extraction.
-- `REMOTE_DESTINATIONS` is newline-delimited, never evaluated as shell code.
-- `NETWORK_TEMP_DIR` contains generated batch files, manifests, helper scripts, and
-  control sockets; `cleanup` removes it on normal exit and signals.
-- `LAST_PART_PREFIX`, `LAST_MANIFEST`, and `LAST_ARCHIVE` connect local creation to
-  an optional immediate network push.
+- Never introduce `eval`, unquoted user data, or executable manifest content.
+- Never publish local or remote output before validation succeeds.
+- Every background PID must be registered and unregistered after `wait`.
+- Every remote stage must be either published or aborted.
+- Every destructive recursive removal must pass `safe_remove_tree` locally or
+  use a path created from a validated absolute remote root.
+- Structured output must escape all JSON control characters and must not alter
+  the action exit status when a consumer closes its descriptor.
+- Any new feature must be added to the feature matrix and rejected below its
+  intended `FEATURE_LEVEL`.
 
-## Invariants
-
-- A compressed set is published only after all producer processes succeed.
-- Strict creation inventories the source before and after compression and rejects a
-  source that changes in flight.
-- Strict reconstruction verifies each part and the aggregate archive hash.
-- Strict extraction regenerates the canonical source inventory.
-- Remote files use `.partial` names until size and SHA-256 verification succeeds.
-- Remote bundle publication occurs only after helper verification.
-- Lower releases reject later features even though the shared source contains dormant
-  helper functions for those milestones.
-
-## Feature-specific notes
-
-- Only the 4.0 transactional single-destination network layer is callable. Advanced tuning and 4.2 administration functions are hard-gated.
-
-## Portability boundary
-
-This original feature release keeps its GNU-oriented utility assumptions. The corresponding `.1` package adds macOS/BSD abstraction without changing the feature level.
-
-## Maintainer checks
-
-```sh
-sh -n src/zstd-splitter.sh
-sh tests/documentation-test.sh
-sh tests/feature-matrix-test.sh
-sh tests/smoke-test.sh
-sh tests/network-dry-run.sh
-```
-
-Maintenance releases also run `tests/portability-test.sh`. Network behavior is
-covered by `tests/mock-network-test.sh`; it is a deterministic simulation and does
-not replace a physical OpenSSH interoperability test.
+See `RUNTIME-SECURITY.md` for the audited threat model and residual risks.
