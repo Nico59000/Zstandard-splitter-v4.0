@@ -1,54 +1,25 @@
 #!/bin/sh
 
-# zstd-splitter.sh 4.0
-# Create a tar stream, compress it with a selectable engine, split it into
-# parts, join those parts, extract archives, and optionally enforce a strict
-# SHA-256 integrity manifest.
+# zstd-splitter.sh 4.0 — POSIX tar compression, splitting, integrity, and SSH/SFTP.
 #
-# The command-line interface follows POSIX utility conventions: short options,
-# getopts parsing, options before operands, and -- as the end-of-options marker.
-# The implementation is written for POSIX /bin/sh. External compression and
-# SHA-256 utilities are required for the selected features.
-
+# EIGIIB: contracts and hazards are explicit; routine mechanics stay implicit
+# in names, ordering, and tests. Comments explain why, not what the next line does.
 #
-# Implementation map
-# ------------------
-# 1. CLI/help and process cleanup.
-# 2. Compression-engine normalization and validation.
-# 3. Portable file-size/SHA-256 primitives and strict manifest handling.
-# 4. Local compress, split, join, verify, and extract workflows.
-# 5. Network option parsing and FEATURE_LEVEL capability gates.
-# 6. SSH/SFTP transport, retry, staging, remote verification, and publication.
-# 7. Version-gated profiles, diagnostics, fan-out, relay, and administration.
-# 8. Interactive front end and main option dispatcher.
+# Flow: bootstrap -> observers -> safeguards -> engines -> manifest -> local work
+#       -> network policy -> transport/transactions -> version-gated admin -> CLI.
 #
-# Shared-source policy
-# --------------------
-# The 4.x releases intentionally share one implementation skeleton. Functions
-# belonging to later milestones may be present in an earlier script, but they
-# are unreachable unless FEATURE_LEVEL permits them. network_validate_settings,
-# network_initialize, network_query, and network_relay are the enforcement
-# boundary; the package feature-matrix test verifies that boundary.
-#
-# Data and security contracts
-# ---------------------------
-# * Strict manifests are data, never shell code.
-# * Remote paths are quoted before command construction.
-# * Remote publication uses staging plus an optional lock and atomic rename.
-# * A final archive is not published before size, SHA-256, and native codec
-#   verification succeed at the requested verification level.
-# * Jumbo/MTU support is diagnostic only and never changes host networking.
-# * Exit status 0 means success, 1 means an operational/integrity failure, and
-#   2 means invalid syntax, an invalid option, or a version-gate violation.
+# Invariants:
+# - manifests are parsed as data, never executed;
+# - validated output is published transactionally;
+# - user-controlled remote text is validated and quoted;
+# - temporary state is private and cleaned on exit or signal;
+# - FEATURE_LEVEL is the sole capability boundary across the shared 4.x skeleton.
 
 set -eu
 LC_ALL=C
 export LC_ALL
 
-# Runtime environment hardening.  Archive data and remote staging may contain
-# sensitive material, so files created by this process are private by default.
-# Environment variables that can silently inject options into tar/compressors
-# are cleared before any external utility is started.
+# Neutralize ambient tool options; generated state is private by default.
 IFS=' \t\n'
 CDPATH=
 ENV=
@@ -142,9 +113,7 @@ ACTIVE_STAGE_LOCK=
 NETWORK_CONNECTED_TARGETS=
 
 
-# -----------------------------------------------------------------------------
-# CLI presentation and user-visible diagnostics
-# -----------------------------------------------------------------------------
+# -- Diagnostics and observer channels --
 escape_control_text()
 {
     ZSS_ESCAPE_VALUE=$1
@@ -172,9 +141,7 @@ print_info()
     printf '%s\n' "$(escape_control_text "$*")"
 }
 
-# -----------------------------------------------------------------------------
-# Runtime-security primitives
-# -----------------------------------------------------------------------------
+# -- Runtime safeguards and lifecycle --
 runtime_sanitize_path()
 {
     [ "$RUNTIME_PATH_READY" -eq 0 ] || return 0
@@ -635,79 +602,47 @@ Usage:
   $PROGRAM_NAME -P -i -R DESTINATION [-O NAME=VALUE] INPUT
   $PROGRAM_NAME -G -i -R REMOTE_INPUT [-d DIRECTORY] [-O NAME=VALUE]
   $PROGRAM_NAME -Q MODE [-R DESTINATION] [-O NAME=VALUE]
-  $PROGRAM_NAME -E
-  $PROGRAM_NAME -h
-  $PROGRAM_NAME
+  $PROGRAM_NAME -E | -h
 
-Local actions:
-  -c            Create a tar archive, compress it, and split it.
-  -j            Join archive parts and verify the reconstructed stream.
-  -x            Extract an archive, or join parts and then extract them.
-  -v            Verify an archive or a set of parts without extracting it.
-  -E            List supported compression engines.
+Actions:
+  -c  create, compress, and split a tar stream
+  -j  join parts and verify the reconstructed archive
+  -x  extract an archive or verified part set
+  -v  verify without extracting
+  -P  push a strict archive set through SSH/SFTP
+  -G  pull and verify a remote archive set
+  -Q  query network or config
+  -E  list compression engines
 
-Network actions:
-  -P            Push a local archive or strict part set through SSH/SFTP.
-  -G            Pull one remote archive or part set through SSH/SFTP.
-  -Q MODE       Run a query: network, or config.
+Core options:
+  -e ENGINE    compression engine; default: zstd
+  -s SIZE      maximum part size; required with -c
+  -l LEVEL     engine-specific compression level
+  -T THREADS   zstd/xz/lzma workers; default: 0
+  -i            strict SHA-256 manifest processing
+  -m MANIFEST   explicit manifest
+  -d DIRECTORY  extraction or pull destination
+  -f            permit replacement; required for destructive maintenance
+  -R SPEC       [USER@]HOST:/absolute/path
+  -O NAME=VALUE network option; repeatable
+  -F FILE       network option file
+  -h            display help
+  --            end option processing
 
-Network selection:
-  -R SPEC       Remote specification: [USER@]HOST:/absolute/path.
-                One effective remote is accepted per operation.
-  -O NAME=VALUE Set a network option. Repeatable.
-  -F FILE       Read network options from FILE (one NAME=VALUE per line).
+Network scope:
+  Transactional single-destination push/pull, staging, verification,
+  locking, optional remote extraction, and atomic publication.
+  This feature release uses the GNU-oriented dependency profile; the
+  matching .1 maintenance release adds macOS/BSD abstractions.
 
-Common options:
-  -e ENGINE     Compression engine used with -c. Default: zstd.
-  -s SIZE       Maximum size of each part. Required with -c.
-  -l LEVEL      Compression level. The accepted range depends on ENGINE.
-  -T THREADS    Worker threads for zstd, xz, or lzma. Default: 0.
-  -i            Enable strict SHA-256 integrity processing.
-  -m MANIFEST   Use an explicit strict-integrity manifest.
-  -d DIRECTORY  Local extraction or pull destination.
-  -f            Permit replacement of an existing output.
-  -h            Display this help text and exit.
-  --            End option processing.
+Safety rule:
+  stdout is reserved for ordinary command output; diagnostics use stderr.
 
-Baseline network options (4.0 and later):
-  transport=sftp|ssh-stream       resume=yes|no       atomic=yes|no
-  remote-verify=parts|archive|content|all|none
-  remote-extract=PATH|auto        remote-fsync=yes|no
-  identity=FILE                   port=PORT           jump=HOST
-  host-key-policy=strict|accept-new
-  known-hosts=FILE                address-family=any|inet|inet6
-  bind-interface=INTERFACE        bind-address=ADDRESS
-  ssh-compression=yes|no          bandwidth=KBIT/S
-  connect-timeout=SECONDS         server-alive-interval=SECONDS
-  server-alive-count=COUNT        retry=COUNT
-  retry-delay=SECONDS             retry-backoff=linear|exponential
-  cleanup=success|always|never    retain=parts|archive|all
-  lock=yes|no                     allow-unverified=yes|no
-  dry-run=yes|no
+Runtime environment:
+  ZSTD_SPLITTER_PATH    trusted absolute command-search path
+  ZSTD_SPLITTER_TMPDIR  trusted absolute parent for private state
 
-Release capability boundary:
-  3.0: strict source, archive, and per-part SHA-256 integrity.
-  4.0: transactional single-destination SSH/SFTP push and pull.
-  This release does not enable 4.1 profiles, parallelism, SFTP-window
-  tuning, connection-reuse controls, or MTU diagnostics.
-  This release does not enable 4.2 fan-out, quorum, relay, health,
-  inventory, garbage collection, or JSONL audit logging.
-
-Examples:
-  $PROGRAM_NAME -c -i -s 1G -R backup@nas:/srv/backups source
-  $PROGRAM_NAME -P -i -R backup@nas:/srv/backups archive.tar.zst.part.aaaaaa
-  $PROGRAM_NAME -G -i -R backup@nas:/srv/backups/archive.tar.zst.bundle/archive.tar.zst.part.aaaaaa -d restored-parts
-
-Runtime-security environment:
-  ZSTD_SPLITTER_PATH     Trusted colon-separated absolute command path.
-  ZSTD_SPLITTER_TMPDIR   Trusted absolute parent for private network state.
-                         Ambient TMPDIR is intentionally ignored.
-
-Compatibility aliases:
-  $PROGRAM_NAME --help       is accepted as an alias for -h.
-  $PROGRAM_NAME --engines    is accepted as an alias for -E.
-
-When run without arguments, the script displays the local interactive menu.
+See the installed man page and package docs/INDEX.md for full contracts.
 EOF_USAGE
 }
 
@@ -772,9 +707,7 @@ require_integrity_commands()
     done
 }
 
-# -----------------------------------------------------------------------------
-# Compression-engine registry and argument validation
-# -----------------------------------------------------------------------------
+# -- Compression and metadata backends --
 normalize_engine()
 {
     case $1 in
@@ -966,9 +899,6 @@ size_to_bytes()
     '
 }
 
-# -----------------------------------------------------------------------------
-# File metadata and SHA-256 abstraction
-# -----------------------------------------------------------------------------
 file_size()
 {
     wc -c <"$1" | awk '{print $1}'
@@ -984,9 +914,7 @@ sha256_stream()
     sha256sum | awk '{print $1}'
 }
 
-# -----------------------------------------------------------------------------
-# Strict manifest canonicalization, generation, and validation
-# -----------------------------------------------------------------------------
+# -- Integrity manifest --
 encode_manifest_text()
 {
     ZSS_ENCODE_VALUE=$1
@@ -1261,9 +1189,6 @@ write_integrity_manifest()
     } >"$wim_output_manifest"
 }
 
-# -----------------------------------------------------------------------------
-# Codec process launch and native stream verification
-# -----------------------------------------------------------------------------
 start_compressor()
 {
     compressor_input=$1
@@ -1331,9 +1256,6 @@ verify_archive_native()
     esac
 }
 
-# -----------------------------------------------------------------------------
-# Archive naming, engine inference, and manifest resolution
-# -----------------------------------------------------------------------------
 detect_engine_from_part()
 {
     case $1 in
@@ -1504,9 +1426,6 @@ validate_parts_against_manifest()
     print_info "Strict SHA-256 verification passed for $expected_part_count parts."
 }
 
-# -----------------------------------------------------------------------------
-# Local part reconstruction primitives
-# -----------------------------------------------------------------------------
 concatenate_parts()
 {
     selected_part=$1
@@ -1550,11 +1469,9 @@ concatenate_parts()
     print_info "Joined parts: $joined_count"
 }
 
-# -----------------------------------------------------------------------------
-# Local high-level workflows: create, join, verify, and extract
-# -----------------------------------------------------------------------------
 # Creates the tar+codec stream, splits it, and publishes outputs only after
 # all child processes and strict source stability checks succeed.
+# -- Local archive workflows --
 compress_and_split()
 {
     source_path=$1
@@ -2100,9 +2017,7 @@ network_find_last_option()
     '
 }
 
-# -----------------------------------------------------------------------------
-# Network profiles, option application, and feature-level validation
-# -----------------------------------------------------------------------------
+# -- Network policy and capability gates --
 network_apply_profile()
 {
     profile_name=$1
@@ -2320,9 +2235,7 @@ network_count_remotes()
     printf '%s\n' "$REMOTE_DESTINATIONS" | awk 'NF { count++ } END { print count + 0 }'
 }
 
-# -----------------------------------------------------------------------------
-# Remote specification parsing and safe command quoting
-# -----------------------------------------------------------------------------
+# -- SSH/SFTP transport and remote transactions --
 parse_remote_spec()
 {
     remote_spec=$1
@@ -2441,9 +2354,6 @@ network_print_command()
     printf '\n'
 }
 
-# -----------------------------------------------------------------------------
-# SSH/SFTP command construction and retryable transport primitives
-# -----------------------------------------------------------------------------
 # Builds one non-interactive SSH command from validated state. No user-provided
 # network option is evaluated as shell source.
 ssh_run()
@@ -2552,9 +2462,6 @@ sftp_get_one()
     sftp_run_batch "$get_destination" "$get_batch"
 }
 
-# -----------------------------------------------------------------------------
-# Audit records and local transfer-set preparation
-# -----------------------------------------------------------------------------
 json_escape()
 {
     ZSS_JSON_VALUE=$1
@@ -2690,9 +2597,6 @@ network_get_one()
     esac
 }
 
-# -----------------------------------------------------------------------------
-# Remote preflight, transactional staging, verification, and publication
-# -----------------------------------------------------------------------------
 network_remote_verify_commit()
 {
     verify_target=$1; verify_partial=$2; verify_final=$3; verify_size=$4; verify_sha=$5
@@ -3215,6 +3119,7 @@ network_adaptive_recommendation()
     esac
 }
 
+# -- Version-gated administration and relay --
 network_query()
 {
     query_mode=$1
@@ -3254,9 +3159,6 @@ network_query()
     done <"$query_remote_list"
 }
 
-# -----------------------------------------------------------------------------
-# Remote-to-remote relay support (FEATURE_LEVEL 42)
-# -----------------------------------------------------------------------------
 network_fetch_remote_manifest()
 {
     fetch_spec=$1
@@ -3353,9 +3255,7 @@ network_relay()
     [ "$relay_success" -ge "$relay_required" ]
 }
 
-# -----------------------------------------------------------------------------
-# Interactive terminal front end and program entry point
-# -----------------------------------------------------------------------------
+# -- CLI dispatch --
 interactive_mode()
 {
     if [ ! -t 0 ]; then

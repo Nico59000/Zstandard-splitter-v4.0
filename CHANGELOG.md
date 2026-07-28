@@ -30,3 +30,9 @@
 - Retry, keepalive, bastion, identity and host-key controls.
 
 - Corrected recursive strict-inventory path isolation for sibling filesystem objects.
+
+## EIGIIB documentation and architecture review — 2026-07-28
+
+- aligned code comments, help, README, man page, examples, configuration, and feature gates;
+- added a layered documentation index and executable EIGIIB review;
+- no archive format or runtime feature level changed.

@@ -1,136 +1,99 @@
-.TH ZSTD-SPLITTER 1 "July 2026" "zstd-splitter 4.0" "User Commands"
+.TH ZSTD-SPLITTER 1 "2026-07-28" "zstd-splitter 4.0" "User Commands"
 .SH NAME
-zstd-splitter \- create, split, verify, transfer, reconstruct and extract compressed tar archives
+zstd-splitter \- tar compression, splitting, integrity, and SSH/SFTP transfer
 .SH SYNOPSIS
-.B zstd-splitter -c -s size [options] source
+.B zstd-splitter
+-c -s SIZE [options] SOURCE
 .br
-.B zstd-splitter -j [options] part
+.B zstd-splitter
+-j|-x|-v [options] INPUT
 .br
-.B zstd-splitter -x [options] input
+.B zstd-splitter
+-P -i -R DESTINATION [network-options] INPUT
 .br
-.B zstd-splitter -v [options] input
-.br
-.B zstd-splitter -P -i -R destination [options] input
-.br
-.B zstd-splitter -G -i -R remote-input [options]
-.br
-.B zstd-splitter -Q mode [ -R destination ] [options]
+.B zstd-splitter
+-G -i -R REMOTE_INPUT [network-options]
 .SH DESCRIPTION
-Version 4.0 is a POSIX /bin/sh utility for selectable tar compression engines, deterministic split-part naming, optional strict SHA-256 manifests, and version-gated SSH/SFTP workflows.
-.PP
-Strict mode records a canonical source inventory, the compressed archive size and SHA-256, and the size and SHA-256 of every part. Verification and extraction recheck the applicable layers before publication.
-.SH LOCAL ACTIONS
+Version 4.0 is a POSIX /bin/sh release at feature level 40. It preserves the strict manifest format inherited from 3.0 and publishes local and remote output only after validation.
+.SH ACTIONS AND OPTIONS
 .TP
 .B -c
-Create, compress and split a tar stream.
+Create, compress, and split a tar stream.
 .TP
 .B -j
-Verify and join split parts.
+Join parts and verify the archive.
 .TP
 .B -x
-Extract an archive or a verified part set.
+Extract a verified archive or part set.
 .TP
 .B -v
 Verify without extraction.
 .TP
-.B -E
-List compression engines.
-.SH NETWORK ACTIONS
-.TP
 .B -P
-Push one local archive or strict part set.
+Push through SSH/SFTP.
 .TP
 .B -G
-Pull one remote archive or part set.
+Pull and verify through SSH/SFTP.
 .TP
-.BI -Q " mode"
-Run one of: network, config.
-.SH COMMON OPTIONS
+.B -Q MODE
+Query network or config.
 .TP
-.BI -e " engine"
-Select zstd, gzip, bzip2, xz, lzma, lzip, lzop or lz4.
-.TP
-.BI -s " size"
-Maximum split-part size.
-.TP
-.BI -l " level"
-Codec-specific compression level.
-.TP
-.BI -T " threads"
-Worker count for supported codecs.
+.B -E
+List compression engines.
 .TP
 .B -i
-Enable strict integrity.
+Enable strict SHA-256 processing.
 .TP
-.BI -m " manifest"
-Use an explicit strict manifest.
+.B -m MANIFEST
+Use an explicit manifest.
 .TP
-.BI -d " directory"
-Extraction or pull destination.
+.B -d DIRECTORY
+Set extraction or pull destination.
 .TP
 .B -f
-Allow replacement; also required for destructive GC in 4.2 releases.
+Permit replacement or destructive maintenance.
 .TP
-.BI -R " [user@]host:/absolute/path"
-Select a remote source or destination.
+.B -R SPEC
+Set [user@]host:/absolute/path.
 .TP
-.BI -O " name=value"
-Set one network option; repeatable.
+.B -O NAME=VALUE
+Set a network option; repeatable.
 .TP
-.BI -F " file"
+.B -F FILE
 Read network options from a file.
+.TP
+.B -h
+Display help.
 .SH NETWORK MODEL
-All 4.x releases provide strict single-destination push/pull, retry, staging, locking, remote verification, atomic bundle publication, optional remote extraction, bandwidth limiting, bastion/identity controls, and safe host-key policies.
-
-.SS 4.1 boundary
-Profiles, parallel workers, SFTP-window tuning, connection-reuse tuning, and route/MTU diagnostics are rejected by this release.
-.SS 4.2 administration boundary
-Fan-out, quorum, relay, health, inventory, garbage collection and JSONL audit are rejected.
-
+One effective destination is accepted. Push and pull use staging, retries, verification, optional locks, optional remote extraction, and atomic publication.
+.PP
+Detailed NAME=VALUE settings are documented in docs/NETWORK-OPTIONS.md in the source package.
+.SH STRICT INTEGRITY
+Strict mode records and validates the canonical source inventory, whole compressed archive, each split part, and restored content. SHA-256 provides integrity, not origin authentication.
 .SH PORTABILITY
-This original feature release expects the GNU-oriented dependency set documented in the package. Use the corresponding .1 maintenance release for macOS/BSD abstraction.
-.SH FEATURE LEVEL
-The executable declares FEATURE_LEVEL=40. Dormant later-version helper functions in the shared source are not public capabilities; runtime gates and tests enforce this boundary.
-.SH FILES
-.TP
-.I *.manifest.sha256
-Strict integrity manifest.
-.TP
-.I *.part.aaaaaa
-Split archive part.
-.TP
-.I *.bundle
-Atomically published remote bundle directory.
-.SH EXIT STATUS
-0 for success, 1 for operational or integrity failure, and 2 for invalid syntax, invalid options, or a feature-gate violation.
+This feature release uses the GNU-oriented dependency profile. The matching .1 maintenance release adds macOS/BSD utility abstraction without changing feature level.
 .SH SECURITY
-StrictHostKeyChecking is never disabled. Remote payload files remain partial until verified. Manifests are parsed as data and are not sourced as shell code.
-
-.SH RUNTIME SECURITY AUDIT
-The 2026-07-28 package revision uses a private umask, sanitized command
-lookup, private temporary directories, global signal cleanup, receiver-side
-verification, transactional local and remote publication, and explicit
-cleanup of remote staging and persistent SSH control masters.
-Archive members are listed and checked before extraction into a private
-staging tree. FIFO, device, socket, control-character path, ambiguous
-manifest, option-like SSH target, and unsafe jump-hop inputs are refused.
-.PP
-The environment variable
-.B ZSTD_SPLITTER_TMPDIR
-is the only supported override for the private network temporary parent;
-ambient
-.B TMPDIR
-is intentionally ignored. The override and every directory in
-.B ZSTD_SPLITTER_PATH
-must be administrator-controlled.
-.PP
-SHA-256 manifests provide integrity but not origin authentication. Running
-untrusted extraction as root, operating in attacker-writable parent
-directories, resource exhaustion, and concurrent source mutation remain
-outside the protection that a portable shell script can fully guarantee.
-See
-.B docs/RUNTIME-SECURITY.md
-in the distribution.
-
+Host-key checking defaults to strict. Temporary state is private. Archive extraction and publication are transactional. Protect SSH keys, known_hosts, manifests, parent directories, and resource limits. See docs/RUNTIME-SECURITY.md.
+.SH DOCUMENTATION
+README.md is the entry point. docs/INDEX.md routes to exact protocol, security, architecture, portability, and test documents. Code comments follow EIGIIB and state rationale rather than line-by-line mechanics.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Operational, integrity, file, or network failure.
+.TP
+.B 2
+Usage, configuration, or feature-gate error.
+.TP
+.B 128+N
+Termination by signal N.
+.SH FILES
+.I /usr/local/bin/zstd-splitter
+.br
+.I /usr/local/share/man/man1/zstd-splitter.1.gz
 .SH SEE ALSO
-tar(1), ssh(1), sftp(1), sha256sum(1), shasum(1), openssl(1)
+.BR ssh (1),
+.BR sftp (1),
+.BR tar (1)
